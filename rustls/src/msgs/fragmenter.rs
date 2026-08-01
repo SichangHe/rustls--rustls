@@ -7,12 +7,16 @@ pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
 
 pub struct MessageFragmenter {
     max_frag: usize,
+    configured_max_frag: usize,
+    peer_inner_limit: usize,
 }
 
 impl Default for MessageFragmenter {
     fn default() -> Self {
         Self {
             max_frag: MAX_FRAGMENT_LEN,
+            configured_max_frag: MAX_FRAGMENT_LEN,
+            peer_inner_limit: MAX_FRAGMENT_LEN + 1,
         }
     }
 }
@@ -61,12 +65,28 @@ impl MessageFragmenter {
     ///
     /// Returns BadMaxFragmentSize if the size is smaller than 32 or larger than 16389.
     pub fn set_max_fragment_size(&mut self, max_fragment_size: Option<usize>) -> Result<(), Error> {
-        self.max_frag = match max_fragment_size {
+        self.configured_max_frag = match max_fragment_size {
             Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz - PACKET_OVERHEAD,
             None => MAX_FRAGMENT_LEN,
             _ => return Err(Error::BadMaxFragmentSize),
         };
+        self.recompute_max_frag();
         Ok(())
+    }
+
+    /// Apply the peer's RFC 8449 TLSInnerPlaintext limit to future output.
+    /// The trailing TLSInnerPlaintext content type consumes one byte.
+    pub(crate) fn set_peer_record_size_limit(&mut self, inner_limit: usize) {
+        debug_assert!((64..=MAX_FRAGMENT_LEN + 1).contains(&inner_limit));
+        self.peer_inner_limit = inner_limit;
+        self.recompute_max_frag();
+    }
+
+    fn recompute_max_frag(&mut self) {
+        self.max_frag = core::cmp::min(
+            self.configured_max_frag,
+            self.peer_inner_limit.saturating_sub(1),
+        );
     }
 }
 

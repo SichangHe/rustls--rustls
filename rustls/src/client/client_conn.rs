@@ -203,6 +203,12 @@ pub struct ClientConfig {
     /// [ClientConnection::new]: crate::client::ClientConnection::new
     pub max_fragment_size: Option<usize>,
 
+    /// The RFC 8449 protected-record size this endpoint advertises to peers.
+    /// `None` retains the RFC 8446 maximum of 16,385 bytes.
+    /// Values outside RFC 8449's inclusive 64..=16,385 range are rejected
+    /// when constructing the connection.
+    pub record_size_limit: Option<u16>,
+
     /// How to decide what client auth certificate/keys to use.
     pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
 
@@ -876,6 +882,7 @@ impl ConnectionCore<ClientConnectionData> {
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
+        CommonState::validate_record_size_limit(config.record_size_limit)?;
         common_state.protocol = proto;
         common_state.enable_secret_extraction = config.enable_secret_extraction;
         common_state.fips = config.fips();

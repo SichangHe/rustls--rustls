@@ -132,17 +132,6 @@ pub struct InboundPlainMessage<'a> {
     pub payload: &'a [u8],
 }
 
-impl InboundPlainMessage<'_> {
-    /// Returns true if the payload is a CCS message.
-    ///
-    /// We passthrough ChangeCipherSpec messages in the deframer without decrypting them.
-    /// Note: this is prior to the record layer, so is unencrypted. See
-    /// third paragraph of section 5 in RFC8446.
-    pub(crate) fn is_valid_ccs(&self) -> bool {
-        self.typ == ContentType::ChangeCipherSpec && self.payload == [0x01]
-    }
-}
-
 /// Decode a TLS1.3 `TLSInnerPlaintext` encoding.
 ///
 /// `p` is a message payload, immediately post-decryption.  This function

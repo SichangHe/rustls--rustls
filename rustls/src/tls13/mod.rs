@@ -6,6 +6,19 @@ use crate::suites::{CipherSuiteCommon, SupportedCipherSuite};
 
 pub(crate) mod key_schedule;
 
+/// Select the exact AWS-LC TLS 1.3 AEAD/HKDF adapter pair used by this profile.
+pub(crate) fn is_selected_aws_lc_profile(suite: &Tls13CipherSuite) -> bool {
+    #[cfg(feature = "aws_lc_rs")]
+    {
+        crypto::aws_lc_rs::tls13::is_selected_tls13_suite(suite)
+    }
+    #[cfg(not(feature = "aws_lc_rs"))]
+    {
+        let _ = suite;
+        false
+    }
+}
+
 /// A TLS 1.3 cipher suite supported by rustls.
 pub struct Tls13CipherSuite {
     /// Common cipher suite fields.

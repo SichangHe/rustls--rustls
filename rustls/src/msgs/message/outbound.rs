@@ -1,10 +1,11 @@
 use alloc::vec::Vec;
 
-use super::{HEADER_SIZE, MAX_PAYLOAD, MessageError, PlainMessage};
+use super::{HEADER_SIZE, MessageError, PlainMessage};
 use crate::enums::{ContentType, ProtocolVersion};
 use crate::msgs::base::Payload;
-use crate::msgs::codec::{Codec, Reader};
+use crate::msgs::codec::Reader;
 use crate::record_layer::RecordLayer;
+use verus_tls13_record::{FrameError, FrameStatus, HEADER_LEN, classify_frame};
 
 /// A TLS frame, named `TLSPlaintext` in the standard.
 ///
@@ -176,16 +177,33 @@ impl OutboundOpaqueMessage {
     /// `MessageError` allows callers to distinguish between valid prefixes (might
     /// become valid if we read more data) and invalid data.
     pub fn read(r: &mut Reader<'_>) -> Result<Self, MessageError> {
-        let (typ, version, len) = read_opaque_message_header(r)?;
+        let frame = match classify_frame(r.remaining()) {
+            FrameStatus::NeedMore { .. } if r.left() < HEADER_LEN => {
+                return Err(MessageError::TooShortForHeader);
+            }
+            FrameStatus::NeedMore { .. } => return Err(MessageError::TooShortForLength),
+            FrameStatus::Invalid(error) => {
+                return Err(match error {
+                    FrameError::InvalidContentType => MessageError::InvalidContentType,
+                    FrameError::UnknownProtocolVersion => MessageError::UnknownProtocolVersion,
+                    FrameError::InvalidEmptyPayload => MessageError::InvalidEmptyPayload,
+                    FrameError::MessageTooLarge => MessageError::MessageTooLarge,
+                });
+            }
+            FrameStatus::Complete(frame) => frame,
+        };
+        if (frame.version & 0xff00) != 0x0300 {
+            return Err(MessageError::UnknownProtocolVersion);
+        }
 
-        let content = r
-            .take(len as usize)
+        let record = r
+            .take(frame.frame_len)
             .ok_or(MessageError::TooShortForLength)?;
 
         Ok(Self {
-            typ,
-            version,
-            payload: PrefixedPayload::from(content),
+            typ: ContentType::from(frame.content_type),
+            version: ProtocolVersion::from(frame.version),
+            payload: PrefixedPayload::from(&record[HEADER_LEN..]),
         })
     }
 
@@ -269,41 +287,6 @@ impl<const N: usize> From<&[u8; N]> for PrefixedPayload {
     fn from(content: &[u8; N]) -> Self {
         Self::from(&content[..])
     }
-}
-
-pub(crate) fn read_opaque_message_header(
-    r: &mut Reader<'_>,
-) -> Result<(ContentType, ProtocolVersion, u16), MessageError> {
-    let typ = ContentType::read(r).map_err(|_| MessageError::TooShortForHeader)?;
-    // Don't accept any new content-types.
-    if let ContentType::Unknown(_) = typ {
-        return Err(MessageError::InvalidContentType);
-    }
-
-    let version = ProtocolVersion::read(r).map_err(|_| MessageError::TooShortForHeader)?;
-    // Accept only versions 0x03XX for any XX.
-    match &version {
-        ProtocolVersion::Unknown(v) if (v & 0xff00) != 0x0300 => {
-            return Err(MessageError::UnknownProtocolVersion);
-        }
-        _ => {}
-    };
-
-    let len = u16::read(r).map_err(|_| MessageError::TooShortForHeader)?;
-
-    // Reject undersize messages
-    //  implemented per section 5.1 of RFC8446 (TLSv1.3)
-    //              per section 6.2.1 of RFC5246 (TLSv1.2)
-    if typ != ContentType::ApplicationData && len == 0 {
-        return Err(MessageError::InvalidEmptyPayload);
-    }
-
-    // Reject oversize messages
-    if len >= MAX_PAYLOAD {
-        return Err(MessageError::MessageTooLarge);
-    }
-
-    Ok((typ, version, len))
 }
 
 #[cfg(test)]

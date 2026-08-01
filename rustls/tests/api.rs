@@ -6318,6 +6318,60 @@ fn handshakes_complete_and_data_flows_with_gratuitious_max_fragment_sizes() {
     }
 }
 
+#[test]
+fn tls13_record_size_limit_negotiates_directionally_and_fragments() {
+    for suite in [
+        provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+        provider::cipher_suite::TLS13_AES_256_GCM_SHA384,
+        provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+    ] {
+        let provider = CryptoProvider {
+            cipher_suites: vec![suite],
+            ..provider::default_provider()
+        };
+        let mut client_config = make_client_config_with_versions(
+            KeyType::Rsa2048,
+            &[&rustls::version::TLS13],
+            &provider,
+        );
+        let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+        client_config.record_size_limit = Some(64);
+        server_config.record_size_limit = Some(96);
+
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+        do_handshake(&mut client, &mut server);
+
+        let payload = vec![0x5a; 2048];
+        assert_eq!(client.writer().write(&payload).unwrap(), payload.len());
+        transfer(&mut client, &mut server);
+        server.process_new_packets().unwrap();
+        check_read(&mut server.reader(), &payload);
+
+        assert_eq!(server.writer().write(&payload).unwrap(), payload.len());
+        transfer(&mut server, &mut client);
+        client.process_new_packets().unwrap();
+        check_read(&mut client.reader(), &payload);
+    }
+}
+
+#[test]
+fn tls13_record_size_limit_is_not_enforced_without_offer() {
+    let provider = provider::default_provider();
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.record_size_limit = Some(64);
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let payload = vec![0x5a; 2048];
+    assert_eq!(client.writer().write(&payload).unwrap(), payload.len());
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    check_read(&mut server.reader(), &payload);
+}
+
 fn assert_lt(left: usize, right: usize) {
     if left >= right {
         panic!("expected {left} < {right}");
@@ -8042,6 +8096,9 @@ fn test_automatic_refresh_traffic_keys() {
     }
 
     const KEY_UPDATE_SIZE: usize = encrypted_size(5);
+    // The client Finished consumes one old-epoch record and the final old-epoch
+    // record is reserved for KeyUpdate itself.
+    const KEY_UPDATE_OUTPUT_WRITE: u64 = CONFIDENTIALITY_LIMIT - 2;
     let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::default_provider());
 
     let client_config = finish_client_config(
@@ -8074,21 +8131,27 @@ fn test_automatic_refresh_traffic_keys() {
             server.process_new_packets().unwrap()
         );
 
-        // at CONFIDENTIALITY_LIMIT messages, we also have a key_update message sent
+        // The selected engine emits KeyUpdate under the old epoch, before the
+        // application message encrypted with its replacement.
         assert_eq!(
             transferred,
             match i {
-                CONFIDENTIALITY_LIMIT => KEY_UPDATE_SIZE + encrypted_size(message.len()),
+                KEY_UPDATE_OUTPUT_WRITE => KEY_UPDATE_SIZE + encrypted_size(message.len()),
                 _ => encrypted_size(message.len()),
             }
         );
+
+        if i == KEY_UPDATE_OUTPUT_WRITE {
+            assert_eq!(transfer(&mut server, &mut client), KEY_UPDATE_SIZE);
+            client.process_new_packets().unwrap();
+        }
 
         let mut buf = [0u8; 32];
         let recvd = server.reader().read(&mut buf).unwrap();
         assert_eq!(&buf[..recvd], message.as_bytes());
     }
 
-    // finally, server writes and pumps its key_update response
+    // The server already returned its KeyUpdate response at the epoch change.
     let message = b"finished";
     server
         .writer()
@@ -8101,7 +8164,7 @@ fn test_automatic_refresh_traffic_keys() {
         transferred,
         client.process_new_packets().unwrap()
     );
-    assert_eq!(transferred, KEY_UPDATE_SIZE + encrypted_size(message.len()));
+    assert_eq!(transferred, encrypted_size(message.len()));
 }
 
 #[cfg(feature = "tls12")]
@@ -8143,7 +8206,9 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
         let recvd = server.reader().read(&mut buf).unwrap();
 
         match i {
-            1023 => assert_eq!(recvd, 0),
+            // TLS1.2 has no KeyUpdate; reserve the final permitted record for
+            // close_notify after the ClientFinished record.
+            i if i >= CONFIDENTIALITY_LIMIT - 2 => assert_eq!(recvd, 0),
             _ => assert_eq!(&buf[..recvd], message.as_bytes()),
         }
     }

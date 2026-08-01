@@ -977,15 +977,15 @@ impl<Data> ConnectionCore<Data> {
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
     ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-        let version_is_tls13 = matches!(
-            self.common_state.negotiated_version,
-            Some(ProtocolVersion::TLSv1_3)
-        );
-
         let locator = Locator::new(buffer);
 
         loop {
-            let mut iter = DeframerIter::new(&mut buffer[buffer_progress.processed()..]);
+            let mut iter = DeframerIter::new_with_selected_tls13(
+                &mut buffer[buffer_progress.processed()..],
+                self.common_state
+                    .record_layer
+                    .accepts_selected_tls13_protected_records(),
+            );
 
             let (message, processed) = loop {
                 let message = match iter.next().transpose() {
@@ -1004,7 +1004,7 @@ impl<Data> ConnectionCore<Data> {
                     //   expect any plaintext.
                     // * The payload size is indicative of a plaintext alert message.
                     ContentType::Alert
-                        if version_is_tls13
+                        if self.common_state.is_tls13()
                             && !self
                                 .common_state
                                 .record_layer
@@ -1017,41 +1017,54 @@ impl<Data> ConnectionCore<Data> {
                     _ => false,
                 };
 
-                if allowed_plaintext && !self.hs_deframer.is_active() {
-                    break (message.into_plain_message(), iter.bytes_consumed());
-                }
+                let (message, protected) = if allowed_plaintext && !self.hs_deframer.is_active() {
+                    (message.into_plain_message(), false)
+                } else {
+                    let message = match self
+                        .common_state
+                        .record_layer
+                        .decrypt_incoming(message)
+                    {
+                        // failed decryption during trial decryption is not allowed to be
+                        // interleaved with partial handshake data.
+                        Ok(None) if !self.hs_deframer.is_aligned() => {
+                            return Err(
+                                PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage
+                                    .into(),
+                            );
+                        }
 
-                let message = match self
-                    .common_state
-                    .record_layer
-                    .decrypt_incoming(message)
-                {
-                    // failed decryption during trial decryption is not allowed to be
-                    // interleaved with partial handshake data.
-                    Ok(None) if !self.hs_deframer.is_aligned() => {
-                        return Err(
-                            PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage.into(),
-                        );
+                        // failed decryption during trial decryption.
+                        Ok(None) => continue,
+
+                        Ok(Some(message)) => message,
+
+                        Err(err) => return Err(self.handle_deframe_error(err, state)),
+                    };
+
+                    let Decrypted {
+                        want_close_before_decrypt,
+                        plaintext,
+                    } = message;
+
+                    if want_close_before_decrypt {
+                        self.common_state.send_close_notify();
                     }
-
-                    // failed decryption during trial decryption.
-                    Ok(None) => continue,
-
-                    Ok(Some(message)) => message,
-
-                    Err(err) => return Err(self.handle_deframe_error(err, state)),
+                    (plaintext, true)
                 };
 
-                let Decrypted {
-                    want_close_before_decrypt,
-                    plaintext,
-                } = message;
-
-                if want_close_before_decrypt {
-                    self.common_state.send_close_notify();
+                self.common_state
+                    .observe_inbound_record(&message)?;
+                if self.common_state.is_tls13() && message.typ == ContentType::ChangeCipherSpec {
+                    self.common_state
+                        .receive_tls13_change_cipher_spec(protected, message.payload)?;
+                    // Return this record through the normal progress path so its
+                    // bytes are discarded before a later deframe call.  The
+                    // TLS 1.3 CCS branch in `process_msg` only drops it: the
+                    // selected control state above is authoritative.
+                    break (message, iter.bytes_consumed());
                 }
-
-                break (plaintext, iter.bytes_consumed());
+                break (message, iter.bytes_consumed());
             };
 
             if !self.hs_deframer.is_aligned() && message.typ != ContentType::Handshake {
@@ -1113,6 +1126,9 @@ impl<Data> ConnectionCore<Data> {
 
     fn handle_deframe_error(&mut self, error: Error, state: Option<&dyn State<Data>>) -> Error {
         match error {
+            error @ Error::InappropriateMessage { .. } => self
+                .common_state
+                .send_fatal_alert(AlertDescription::UnexpectedMessage, error),
             error @ Error::InvalidMessage(_) => {
                 if self.common_state.is_quic() {
                     self.common_state.quic.alert = Some(AlertDescription::DecodeError);
@@ -1150,18 +1166,8 @@ impl<Data> ConnectionCore<Data> {
                 .may_receive_application_data
             && self.common_state.is_tls13()
         {
-            if !msg.is_valid_ccs() {
-                // "An implementation which receives any other change_cipher_spec value or
-                //  which receives a protected change_cipher_spec record MUST abort the
-                //  handshake with an "unexpected_message" alert."
-                return Err(self.common_state.send_fatal_alert(
-                    AlertDescription::UnexpectedMessage,
-                    PeerMisbehaved::IllegalMiddleboxChangeCipherSpec,
-                ));
-            }
-
-            self.common_state
-                .received_tls13_change_cipher_spec()?;
+            // `process_more_input` has already checked the plaintext byte,
+            // timing, and protection status with the selected control engine.
             trace!("Dropping CCS");
             return Ok(state);
         }

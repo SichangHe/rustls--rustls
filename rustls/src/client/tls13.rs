@@ -500,6 +500,12 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         self.transcript.add_message(&m);
 
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        cx.common
+            .set_record_size_limits(exts.record_size_limit, self.config.record_size_limit)
+            .map_err(|error| {
+                cx.common
+                    .send_fatal_alert(AlertDescription::IllegalParameter, error)
+            })?;
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1554,12 +1560,12 @@ impl ExpectTraffic {
 
         if common.should_update_key(key_update_request)? {
             self.key_schedule
-                .update_encrypter_and_notify(common);
+                .update_encrypter_and_notify(common)?;
         }
 
         // Update our read-side keys.
         self.key_schedule
-            .update_decrypter(common);
+            .update_decrypter(common)?;
         Ok(())
     }
 }

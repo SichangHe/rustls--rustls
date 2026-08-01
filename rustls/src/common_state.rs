@@ -16,8 +16,8 @@ use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{
-    Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
-    PlainMessage,
+    InboundPlainMessage, Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage,
+    OutboundPlainMessage, PlainMessage,
 };
 use crate::record_layer::PreEncryptAction;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
@@ -26,6 +26,7 @@ use crate::tls12::ConnectionSecrets;
 use crate::unbuffered::{EncryptError, InsufficientSizeError};
 use crate::vecbuf::ChunkVecBuffer;
 use crate::{quic, record_layer};
+use verus_tls13_record::{ConnectionControl, DirectionalLimits, HandshakeTracker};
 
 /// Connection state common to both client and server connections.
 pub struct CommonState {
@@ -33,6 +34,9 @@ pub struct CommonState {
     pub(crate) handshake_kind: Option<HandshakeKind>,
     pub(crate) side: Side,
     pub(crate) record_layer: record_layer::RecordLayer,
+    pub(crate) record_control: ConnectionControl,
+    inbound_handshake: HandshakeTracker,
+    outbound_handshake: HandshakeTracker,
     pub(crate) suite: Option<SupportedCipherSuite>,
     pub(crate) kx_state: KxState,
     pub(crate) alpn_protocol: Option<ProtocolName>,
@@ -51,7 +55,6 @@ pub struct CommonState {
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
-    queued_key_update_message: Option<Vec<u8>>,
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
     pub(crate) protocol: Protocol,
@@ -70,6 +73,9 @@ impl CommonState {
             handshake_kind: None,
             side,
             record_layer: record_layer::RecordLayer::new(),
+            record_control: ConnectionControl::new(),
+            inbound_handshake: HandshakeTracker::new(),
+            outbound_handshake: HandshakeTracker::new(),
             suite: None,
             kx_state: KxState::default(),
             alpn_protocol: None,
@@ -86,7 +92,6 @@ impl CommonState {
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
-            queued_key_update_message: None,
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
             enable_secret_extraction: false,
@@ -193,6 +198,43 @@ impl CommonState {
         matches!(self.negotiated_version, Some(ProtocolVersion::TLSv1_3))
     }
 
+    pub(crate) fn observe_outbound_record(
+        &mut self,
+        message: &OutboundPlainMessage<'_>,
+    ) -> Result<(), Error> {
+        if !self.is_tls13() || !self.record_layer.uses_selected_tls13() {
+            return Ok(());
+        }
+        let payload = message.payload.to_vec();
+        let milestone = self
+            .outbound_handshake
+            .observe_record(message.typ.to_array()[0], &payload, true)
+            .map_err(|_| PeerMisbehaved::KeyEpochWithPendingFragment)?;
+        if let Some(milestone) = milestone {
+            self.record_control
+                .observe_milestone(milestone, true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_inbound_record(
+        &mut self,
+        message: &InboundPlainMessage<'_>,
+    ) -> Result<(), Error> {
+        if !self.is_tls13() || !self.record_layer.uses_selected_tls13() {
+            return Ok(());
+        }
+        let milestone = self
+            .inbound_handshake
+            .observe_record(message.typ.to_array()[0], message.payload, false)
+            .map_err(|_| PeerMisbehaved::KeyEpochWithPendingFragment)?;
+        if let Some(milestone) = milestone {
+            self.record_control
+                .observe_milestone(milestone, false);
+        }
+        Ok(())
+    }
+
     pub(crate) fn process_main_protocol<Data>(
         &mut self,
         msg: Message<'_>,
@@ -275,8 +317,6 @@ impl CommonState {
             }
         }
 
-        self.perhaps_write_key_update();
-
         self.check_required_size(outgoing_tls, fragments)?;
 
         let fragments = self
@@ -345,10 +385,21 @@ impl CommonState {
     }
 
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+        if self
+            .observe_outbound_record(&m)
+            .is_err()
+        {
+            self.send_fatal_alert(
+                AlertDescription::UnexpectedMessage,
+                PeerMisbehaved::KeyEpochWithPendingFragment,
+            );
+            return;
+        }
         if m.typ == ContentType::Alert {
             // Alerts are always sendable -- never quashed by a PreEncryptAction.
-            let em = self.record_layer.encrypt_outgoing(m);
-            self.queue_tls_message(em);
+            if let Ok(em) = self.record_layer.encrypt_outgoing(m) {
+                self.queue_tls_message(em);
+            }
             return;
         }
 
@@ -383,8 +434,9 @@ impl CommonState {
             }
         };
 
-        let em = self.record_layer.encrypt_outgoing(m);
-        self.queue_tls_message(em);
+        if let Ok(em) = self.record_layer.encrypt_outgoing(m) {
+            self.queue_tls_message(em);
+        }
     }
 
     fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
@@ -434,14 +486,7 @@ impl CommonState {
 
     // Put m into sendable_tls for writing.
     fn queue_tls_message(&mut self, m: OutboundOpaqueMessage) {
-        self.perhaps_write_key_update();
         self.sendable_tls.append(m.encode());
-    }
-
-    pub(crate) fn perhaps_write_key_update(&mut self) {
-        if let Some(message) = self.queued_key_update_message.take() {
-            self.sendable_tls.append(message);
-        }
     }
 
     /// Send a raw TLS message, fragmenting it if needed.
@@ -473,6 +518,16 @@ impl CommonState {
                 .message_fragmenter
                 .fragment_message(msg);
             for m in iter {
+                if self
+                    .observe_outbound_record(&m)
+                    .is_err()
+                {
+                    self.send_fatal_alert(
+                        AlertDescription::UnexpectedMessage,
+                        PeerMisbehaved::KeyEpochWithPendingFragment,
+                    );
+                    return;
+                }
                 self.queue_tls_message(m.to_unencrypted_opaque());
             }
         } else {
@@ -511,6 +566,33 @@ impl CommonState {
     }
 
     pub(crate) fn process_alert(&mut self, alert: &AlertMessagePayload) -> Result<(), Error> {
+        if self.is_tls13()
+            && self.may_receive_application_data
+            && self.record_layer.uses_selected_tls13()
+        {
+            let payload = [alert.level.to_array()[0], alert.description.to_array()[0]];
+            match self
+                .record_control
+                .receive_alert(&payload)
+            {
+                Ok(verus_tls13_record::AlertAction::PeerClosed) => {
+                    self.has_received_close_notify = true;
+                    return Ok(());
+                }
+                Ok(verus_tls13_record::AlertAction::UserCanceled) => return Ok(()),
+                Ok(verus_tls13_record::AlertAction::Fatal(description)) => {
+                    self.record_layer.terminate();
+                    return Err(Error::AlertReceived(AlertDescription::from(description)));
+                }
+                Err(_) => {
+                    return Err(self.send_fatal_alert(
+                        AlertDescription::DecodeError,
+                        Error::InvalidMessage(InvalidMessage::UnexpectedMessage("Alert")),
+                    ));
+                }
+            }
+        }
+
         // Reject unknown AlertLevels.
         if let AlertLevel::Unknown(_) = alert.level {
             return Err(self.send_fatal_alert(
@@ -568,6 +650,10 @@ impl CommonState {
         let m = Message::build_alert(AlertLevel::Fatal, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
         self.sent_fatal_alert = true;
+        if self.record_layer.uses_selected_tls13() {
+            self.record_control.enter_fatal();
+        }
+        self.record_layer.terminate();
         err.into()
     }
 
@@ -586,6 +672,9 @@ impl CommonState {
         self.sent_fatal_alert = true;
         self.has_sent_close_notify = true;
         self.send_warning_alert_no_log(AlertDescription::CloseNotify);
+        if self.record_layer.uses_selected_tls13() {
+            let _ = self.record_control.send_close_notify();
+        }
     }
 
     pub(crate) fn eager_send_close_notify(
@@ -638,10 +727,16 @@ impl CommonState {
         }
 
         for m in fragments {
-            let em = self
-                .record_layer
-                .encrypt_outgoing(m)
-                .encode();
+            if self
+                .observe_outbound_record(&m)
+                .is_err()
+            {
+                break;
+            }
+            let Ok(em) = self.record_layer.encrypt_outgoing(m) else {
+                break;
+            };
+            let em = em.encode();
 
             let len = em.len();
             outgoing_tls[written..written + len].copy_from_slice(&em);
@@ -654,6 +749,29 @@ impl CommonState {
     pub(crate) fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
         self.message_fragmenter
             .set_max_fragment_size(new)
+    }
+
+    pub(crate) fn set_record_size_limits(
+        &mut self,
+        peer_advertised: Option<u16>,
+        local_advertised: Option<u16>,
+    ) -> Result<(), Error> {
+        let limits = DirectionalLimits::negotiated(
+            peer_advertised.map(usize::from),
+            local_advertised.map(usize::from),
+        )
+        .ok_or_else(|| Error::General("invalid RFC8449 record_size_limit".into()))?;
+        self.message_fragmenter
+            .set_peer_record_size_limit(limits.send_inner_limit.get());
+        self.record_layer
+            .set_directional_limits(limits);
+        Ok(())
+    }
+
+    pub(crate) fn validate_record_size_limit(advertised: Option<u16>) -> Result<(), Error> {
+        DirectionalLimits::negotiated(None, advertised.map(usize::from))
+            .ok_or_else(|| Error::General("invalid RFC8449 record_size_limit".into()))?;
+        Ok(())
     }
 
     pub(crate) fn get_alpn_protocol(&self) -> Option<&[u8]> {
@@ -702,26 +820,118 @@ impl CommonState {
         self.temper_counters
             .received_key_update_request()?;
 
-        match key_update_request {
-            KeyUpdateRequest::UpdateNotRequested => Ok(false),
-            KeyUpdateRequest::UpdateRequested => Ok(self.queued_key_update_message.is_none()),
-            _ => Err(self.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                InvalidMessage::InvalidKeyUpdate,
-            )),
+        let request_update = match key_update_request {
+            KeyUpdateRequest::UpdateNotRequested => false,
+            KeyUpdateRequest::UpdateRequested => true,
+            _ => {
+                return Err(self.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    InvalidMessage::InvalidKeyUpdate,
+                ));
+            }
+        };
+        if !self.record_layer.uses_selected_tls13() {
+            return Ok(request_update);
         }
+        self.record_control
+            .begin_inbound_key_update(request_update)
+            .map_err(|_| {
+                self.send_fatal_alert(
+                    AlertDescription::UnexpectedMessage,
+                    InvalidMessage::UnexpectedMessage("KeyUpdate"),
+                )
+            })?;
+        Ok(request_update)
     }
 
-    pub(crate) fn enqueue_key_update_notification(&mut self) {
-        let message = PlainMessage::from(Message::build_key_update_notify());
-        self.queued_key_update_message = Some(
-            self.record_layer
-                .encrypt_outgoing(message.borrow_outbound())
-                .encode(),
-        );
+    pub(crate) fn begin_outbound_key_update(&mut self) -> Result<(), Error> {
+        if !self.record_layer.uses_selected_tls13() {
+            return Ok(());
+        }
+        self.record_control
+            .begin_outbound_key_update(self.aligned_handshake)
+            .map_err(|_| {
+                self.send_fatal_alert(
+                    AlertDescription::UnexpectedMessage,
+                    InvalidMessage::UnexpectedMessage("KeyUpdate"),
+                )
+            })
     }
 
-    pub(crate) fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
+    pub(crate) fn commit_inbound_key_update(&mut self) -> Result<(), Error> {
+        if !self.record_layer.uses_selected_tls13() {
+            return Ok(());
+        }
+        self.record_control
+            .commit_inbound_key_update()
+            .map(|_| ())
+            .map_err(|_| {
+                self.send_fatal_alert(
+                    AlertDescription::UnexpectedMessage,
+                    InvalidMessage::UnexpectedMessage("KeyUpdate"),
+                )
+            })
+    }
+
+    pub(crate) fn commit_outbound_key_update(&mut self) -> Result<(), Error> {
+        if !self.record_layer.uses_selected_tls13() {
+            return Ok(());
+        }
+        self.record_control
+            .commit_outbound_key_update()
+            .map(|_| ())
+            .map_err(|_| {
+                self.send_fatal_alert(
+                    AlertDescription::UnexpectedMessage,
+                    InvalidMessage::UnexpectedMessage("KeyUpdate"),
+                )
+            })
+    }
+
+    pub(crate) fn enqueue_key_update_notification(&mut self) -> Result<(), Error> {
+        self.enqueue_key_update_record(PlainMessage::from(Message::build_key_update_notify()))
+    }
+
+    pub(crate) fn enqueue_key_update_request(&mut self) -> Result<(), Error> {
+        self.enqueue_key_update_record(PlainMessage::from(Message::build_key_update_request()))
+    }
+
+    fn enqueue_key_update_record(&mut self, message: PlainMessage) -> Result<(), Error> {
+        let outbound = message.borrow_outbound();
+        if let Err(error) = self.observe_outbound_record(&outbound) {
+            self.record_control.enter_fatal();
+            self.record_layer.terminate();
+            return Err(error);
+        }
+        let encrypted = match self
+            .record_layer
+            .encrypt_outgoing(outbound)
+        {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                self.record_control.enter_fatal();
+                self.record_layer.terminate();
+                return Err(error);
+            }
+        };
+        self.sendable_tls
+            .append(encrypted.encode());
+        Ok(())
+    }
+
+    pub(crate) fn receive_tls13_change_cipher_spec(
+        &mut self,
+        protected: bool,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        self.record_control
+            .receive_ccs(protected, payload)
+            .map_err(|_| {
+                self.send_fatal_alert(
+                    AlertDescription::UnexpectedMessage,
+                    PeerMisbehaved::IllegalMiddleboxChangeCipherSpec,
+                )
+            })?;
         self.temper_counters
             .received_tls13_change_cipher_spec()
     }
@@ -739,7 +949,6 @@ impl CommonState {
         payload: OutboundChunks<'_>,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
-        self.perhaps_write_key_update();
         self.send_plain(payload, Limit::Yes, sendable_plaintext)
     }
 
@@ -774,6 +983,17 @@ impl CommonState {
                 Limit::No => sendable_plaintext.append(payload.to_vec()),
             };
             return len;
+        }
+
+        if self.record_layer.uses_selected_tls13()
+            && self
+                .record_control
+                .can_send_application_data()
+                .is_err()
+        {
+            // Preserve the `Write` contract after close_notify while the selected
+            // profile prevents any later application record from being emitted.
+            return payload.len();
         }
 
         self.send_plain_non_buffering(payload, limit)

@@ -316,6 +316,12 @@ pub struct ServerConfig {
     /// [ServerConnection::new]: crate::server::ServerConnection::new
     pub max_fragment_size: Option<usize>,
 
+    /// The RFC 8449 protected-record size this endpoint advertises to peers.
+    /// `None` retains the RFC 8446 maximum of 16,385 bytes.
+    /// Values outside RFC 8449's inclusive 64..=16,385 range are rejected
+    /// when constructing the connection.
+    pub record_size_limit: Option<u16>,
+
     /// How to store client sessions.
     ///
     /// See [ServerConfig#sharing-resumption-storage-between-serverconfigs]
@@ -1069,6 +1075,9 @@ impl Accepted {
             // is with the fragment size configured in the `ServerConfig`.
             return Err((err, AcceptedAlert::empty()));
         }
+        if let Err(err) = CommonState::validate_record_size_limit(config.record_size_limit) {
+            return Err((err, AcceptedAlert::empty()));
+        }
 
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
 
@@ -1225,6 +1234,7 @@ impl ConnectionCore<ServerConnectionData> {
     ) -> Result<Self, Error> {
         let mut common = CommonState::new(Side::Server);
         common.set_max_fragment_size(config.max_fragment_size)?;
+        CommonState::validate_record_size_limit(config.record_size_limit)?;
         common.enable_secret_extraction = config.enable_secret_extraction;
         common.fips = config.fips();
         Ok(Self::new(

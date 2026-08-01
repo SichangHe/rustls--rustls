@@ -917,6 +917,10 @@ extension_struct! {
         ExtensionType::CompressCertificate =>
             pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
 
+        /// Maximum protected TLSInnerPlaintext size accepted by this endpoint (RFC8449).
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
+
         /// Session ticket offer or request (RFC5077/RFC8446)
         ExtensionType::SessionTicket =>
             pub(crate) session_ticket: Option<ClientSessionTicket>,
@@ -994,6 +998,7 @@ impl ClientExtensions<'_> {
             server_certificate_types,
             extended_master_secret_request,
             certificate_compression_algorithms,
+            record_size_limit,
             session_ticket,
             preshared_key_offer,
             early_data_request,
@@ -1022,6 +1027,7 @@ impl ClientExtensions<'_> {
             server_certificate_types,
             extended_master_secret_request,
             certificate_compression_algorithms,
+            record_size_limit,
             session_ticket,
             preshared_key_offer,
             early_data_request,
@@ -1211,6 +1217,10 @@ extension_struct! {
         ExtensionType::ClientCertificateType =>
             pub(crate) client_certificate_type: Option<CertificateType>,
 
+        /// Maximum protected TLSInnerPlaintext size accepted by this endpoint (RFC8449).
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
+
         /// Selected server certificate type (RFC7250)
         ExtensionType::ServerCertificateType =>
             pub(crate) server_certificate_type: Option<CertificateType>,
@@ -1262,6 +1272,7 @@ impl ServerExtensions<'_> {
             key_share,
             preshared_key,
             client_certificate_type,
+            record_size_limit,
             server_certificate_type,
             extended_master_secret_ack,
             certificate_status_request_ack,
@@ -1282,6 +1293,7 @@ impl ServerExtensions<'_> {
             key_share,
             preshared_key,
             client_certificate_type,
+            record_size_limit,
             server_certificate_type,
             extended_master_secret_ack,
             certificate_status_request_ack,

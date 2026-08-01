@@ -9,7 +9,6 @@ use crate::crypto::cipher::{AeadKey, Iv, MessageDecrypter, Tls13AeadAlgorithm};
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
 use crate::crypto::{SharedSecret, hash, hmac};
 use crate::error::Error;
-use crate::msgs::message::Message;
 use crate::suites::PartiallyExtractedSecrets;
 use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
 
@@ -291,13 +290,9 @@ impl KeyScheduleHandshake {
         let secret = &self.client_handshake_traffic_secret;
         match skip_requested {
             None => self.ks.set_decrypter(secret, common),
-            Some(max_early_data_size) => common
-                .record_layer
-                .set_message_decrypter_with_trial_decryption(
-                    self.ks
-                        .derive_decrypter(&self.client_handshake_traffic_secret),
-                    max_early_data_size,
-                ),
+            Some(max_early_data_size) => self
+                .ks
+                .set_decrypter_with_trial_decryption(secret, max_early_data_size, common),
         }
     }
 
@@ -519,26 +514,32 @@ pub(crate) struct KeyScheduleTraffic {
 }
 
 impl KeyScheduleTraffic {
-    pub(crate) fn update_encrypter_and_notify(&mut self, common: &mut CommonState) {
+    pub(crate) fn update_encrypter_and_notify(
+        &mut self,
+        common: &mut CommonState,
+    ) -> Result<(), Error> {
+        common.begin_outbound_key_update()?;
         let secret = self.next_application_traffic_secret(common.side);
-        common.enqueue_key_update_notification();
+        common.enqueue_key_update_notification()?;
         self.ks.set_encrypter(&secret, common);
+        common.commit_outbound_key_update()
     }
 
     pub(crate) fn request_key_update_and_update_encrypter(
         &mut self,
         common: &mut CommonState,
     ) -> Result<(), Error> {
-        common.check_aligned_handshake()?;
-        common.send_msg_encrypt(Message::build_key_update_request().into());
+        common.begin_outbound_key_update()?;
+        common.enqueue_key_update_request()?;
         let secret = self.next_application_traffic_secret(common.side);
         self.ks.set_encrypter(&secret, common);
-        Ok(())
+        common.commit_outbound_key_update()
     }
 
-    pub(crate) fn update_decrypter(&mut self, common: &mut CommonState) {
+    pub(crate) fn update_decrypter(&mut self, common: &mut CommonState) -> Result<(), Error> {
         let secret = self.next_application_traffic_secret(common.side.peer());
         self.ks.set_decrypter(&secret, common);
+        common.commit_inbound_key_update()
     }
 
     pub(crate) fn next_application_traffic_secret(&mut self, side: Side) -> OkmBlock {
@@ -756,18 +757,44 @@ impl KeyScheduleSuite {
         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
         let iv = derive_traffic_iv(expander.as_ref());
 
+        let mut provider_limits = self.suite.aead_alg.record_limits();
+        provider_limits.max_records = core::cmp::min(
+            provider_limits.max_records,
+            self.suite.common.confidentiality_limit,
+        );
         common
             .record_layer
-            .set_message_encrypter(
+            .set_tls13_message_encrypter(
                 self.suite.aead_alg.encrypter(key, iv),
-                self.suite.common.confidentiality_limit,
+                provider_limits,
+                crate::tls13::is_selected_aws_lc_profile(self.suite),
             );
     }
 
     fn set_decrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
         common
             .record_layer
-            .set_message_decrypter(self.derive_decrypter(secret));
+            .set_tls13_message_decrypter(
+                self.derive_decrypter(secret),
+                self.suite.aead_alg.record_limits(),
+                crate::tls13::is_selected_aws_lc_profile(self.suite),
+            );
+    }
+
+    fn set_decrypter_with_trial_decryption(
+        &self,
+        secret: &OkmBlock,
+        max_early_data_size: usize,
+        common: &mut CommonState,
+    ) {
+        common
+            .record_layer
+            .set_tls13_message_decrypter_with_trial_decryption(
+                self.derive_decrypter(secret),
+                self.suite.aead_alg.record_limits(),
+                crate::tls13::is_selected_aws_lc_profile(self.suite),
+                max_early_data_size,
+            );
     }
 
     fn derive_decrypter(&self, secret: &OkmBlock) -> Box<dyn MessageDecrypter> {
@@ -965,6 +992,15 @@ fn hkdf_expand_label_inner<F, T>(
 where
     F: FnOnce(&dyn HkdfExpander, &[&[u8]]) -> T,
 {
+    let mut encoded = [0u8; verus_tls13_record::MAX_HKDF_LABEL_LEN];
+    if let Ok(encoded_len) = verus_tls13_record::encode_hkdf_label(&mut encoded, n, label, context)
+    {
+        return f(expander, &[&encoded[..encoded_len]]);
+    }
+
+    // Non-selected exporters retain rustls's historical error-free interface.
+    // TLS 1.3 traffic-update, key, and IV labels always take the verified path
+    // above, whose finite RFC bounds reject no selected-profile input.
     const LABEL_PREFIX: &[u8] = b"tls13 ";
 
     let output_len = u16::to_be_bytes(n as u16);

@@ -677,16 +677,52 @@ fn refresh_traffic_keys_manually() {
         }
     };
 
-    println!("server WriteTraffic");
-    let used = match server.process_tls_records(&mut buffer[..used]) {
+    println!("server key update response");
+    let response_used = match server.process_tls_records(&mut buffer[..used]) {
         UnbufferedStatus {
             discard: actual_used,
-            state: Ok(ConnectionState::WriteTraffic(mut wt)),
+            state: Ok(ConnectionState::EncodeTlsData(mut etd)),
         } => {
             assert_eq!(used, actual_used);
-            wt.encrypt(b"hello", &mut buffer)
-                .unwrap()
+            etd.encode(&mut buffer).unwrap()
         }
+        st => {
+            panic!("unexpected server state {st:?}");
+        }
+    };
+
+    match server.process_tls_records(&mut []) {
+        UnbufferedStatus {
+            discard: 0,
+            state: Ok(ConnectionState::TransmitTlsData(ttd)),
+        } => {
+            ttd.done();
+        }
+        st => {
+            panic!("unexpected server state {st:?}");
+        }
+    };
+
+    match client.process_tls_records(&mut buffer[..response_used]) {
+        UnbufferedStatus {
+            discard: actual_used,
+            state: Ok(ConnectionState::WriteTraffic(_)),
+        } => {
+            assert_eq!(response_used, actual_used);
+        }
+        st => {
+            panic!("unexpected client state {st:?}");
+        }
+    };
+
+    println!("server WriteTraffic");
+    let used = match server.process_tls_records(&mut []) {
+        UnbufferedStatus {
+            discard: 0,
+            state: Ok(ConnectionState::WriteTraffic(mut wt)),
+        } => wt
+            .encrypt(b"hello", &mut buffer)
+            .unwrap(),
         st => {
             panic!("unexpected server state {st:?}");
         }
@@ -746,7 +782,7 @@ fn refresh_traffic_keys_automatically() {
 
     const KEY_UPDATE_SIZE: usize = encrypted_size(5);
     const CONFIDENTIALITY_LIMIT: usize = 1024;
-    const CONFIDENTIALITY_LIMIT_PLUS_ONE: usize = CONFIDENTIALITY_LIMIT + 1;
+    const KEY_UPDATE_OUTPUT_WRITE: usize = CONFIDENTIALITY_LIMIT - 1;
 
     let client_config = finish_client_config(
         KeyType::Rsa2048,
@@ -786,26 +822,66 @@ fn refresh_traffic_keys_automatically() {
                 assert_eq!(
                     used,
                     match i {
-                        // The key_update message triggered by write N appears in write N+1
-                        CONFIDENTIALITY_LIMIT_PLUS_ONE =>
-                            KEY_UPDATE_SIZE + encrypted_size(message.len()),
+                        // Reserve the final old-epoch record for KeyUpdate itself.
+                        KEY_UPDATE_OUTPUT_WRITE => KEY_UPDATE_SIZE + encrypted_size(message.len()),
                         _ => encrypted_size(message.len()),
                     }
                 );
 
-                match server.process_tls_records(&mut buffer[..used]) {
-                    UnbufferedStatus {
-                        discard: actual_used,
-                        state: Ok(ConnectionState::ReadTraffic(mut rt)),
-                    } => {
-                        assert_eq!(used, actual_used);
-                        let record = rt.next_record().unwrap().unwrap();
-                        assert_eq!(record.payload, message.as_bytes());
-                    }
-                    st => {
-                        panic!("unexpected server state {st:?}");
-                    }
-                };
+                if i == KEY_UPDATE_OUTPUT_WRITE {
+                    let mut response = [0u8; KEY_UPDATE_SIZE];
+                    let discard = match server.process_tls_records(&mut buffer[..used]) {
+                        UnbufferedStatus {
+                            discard,
+                            state: Ok(ConnectionState::EncodeTlsData(mut etd)),
+                        } => {
+                            assert_eq!(etd.encode(&mut response).unwrap(), KEY_UPDATE_SIZE);
+                            discard
+                        }
+                        st => {
+                            panic!("unexpected server state {st:?}");
+                        }
+                    };
+                    assert_eq!(discard, KEY_UPDATE_SIZE);
+
+                    match server.process_tls_records(&mut []) {
+                        UnbufferedStatus {
+                            discard: 0,
+                            state: Ok(ConnectionState::TransmitTlsData(ttd)),
+                        } => ttd.done(),
+                        st => {
+                            panic!("unexpected server state {st:?}");
+                        }
+                    };
+
+                    match server.process_tls_records(&mut buffer[discard..used]) {
+                        UnbufferedStatus {
+                            discard: actual_used,
+                            state: Ok(ConnectionState::ReadTraffic(mut rt)),
+                        } => {
+                            assert_eq!(actual_used, used - discard);
+                            let record = rt.next_record().unwrap().unwrap();
+                            assert_eq!(record.payload, message.as_bytes());
+                        }
+                        st => {
+                            panic!("unexpected server state {st:?}");
+                        }
+                    };
+                } else {
+                    match server.process_tls_records(&mut buffer[..used]) {
+                        UnbufferedStatus {
+                            discard: actual_used,
+                            state: Ok(ConnectionState::ReadTraffic(mut rt)),
+                        } => {
+                            assert_eq!(used, actual_used);
+                            let record = rt.next_record().unwrap().unwrap();
+                            assert_eq!(record.payload, message.as_bytes());
+                        }
+                        st => {
+                            panic!("unexpected server state {st:?}");
+                        }
+                    };
+                }
                 println!("{i}: wrote {used}");
             }
         }
@@ -849,7 +925,7 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
                 let mut buffer = [0u8; 64];
                 let used = match wt.encrypt(message.as_bytes(), &mut buffer) {
                     Ok(used) => used,
-                    Err(EncryptError::EncryptExhausted) if i == CONFIDENTIALITY_LIMIT - 1 => {
+                    Err(EncryptError::EncryptExhausted) if i == CONFIDENTIALITY_LIMIT - 2 => {
                         break;
                     }
                     rc @ Err(_) => rc.unwrap(),

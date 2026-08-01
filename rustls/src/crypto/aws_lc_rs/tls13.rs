@@ -6,16 +6,53 @@ use aws_lc_rs::{aead, hkdf, hmac};
 use crate::crypto;
 use crate::crypto::cipher::{
     AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
-    Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
+    Tls13AeadAlgorithm, UnsupportedOperationError,
 };
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
-use crate::error::Error;
+use crate::error::{Error, PeerMisbehaved};
 use crate::msgs::message::{
     InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
 };
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets, SupportedCipherSuite};
 use crate::tls13::Tls13CipherSuite;
+
+// These private component objects, rather than caller-provided provider bounds,
+// identify the AWS-LC TLS 1.3 record profile.  A copied suite retains the same
+// adapter identity while a different AEAD or HKDF implementation cannot opt in.
+static AWS_LC_HKDF_SHA256: AwsLcHkdf = AwsLcHkdf(hkdf::HKDF_SHA256, hmac::HMAC_SHA256);
+static AWS_LC_HKDF_SHA384: AwsLcHkdf = AwsLcHkdf(hkdf::HKDF_SHA384, hmac::HMAC_SHA384);
+static AWS_LC_CHACHA20_POLY1305: Chacha20Poly1305Aead =
+    Chacha20Poly1305Aead(AeadAlgorithm(&aead::CHACHA20_POLY1305));
+static AWS_LC_AES_256_GCM: Aes256GcmAead = Aes256GcmAead(AeadAlgorithm(&aead::AES_256_GCM));
+static AWS_LC_AES_128_GCM: Aes128GcmAead = Aes128GcmAead(AeadAlgorithm(&aead::AES_128_GCM));
+
+fn same_aead_adapter(
+    left: &'static dyn Tls13AeadAlgorithm,
+    right: &'static dyn Tls13AeadAlgorithm,
+) -> bool {
+    let left: *const dyn Tls13AeadAlgorithm = left;
+    let right: *const dyn Tls13AeadAlgorithm = right;
+    core::ptr::eq(left.cast::<()>(), right.cast::<()>())
+}
+
+fn same_hkdf_adapter(left: &'static dyn Hkdf, right: &'static dyn Hkdf) -> bool {
+    let left: *const dyn Hkdf = left;
+    let right: *const dyn Hkdf = right;
+    core::ptr::eq(left.cast::<()>(), right.cast::<()>())
+}
+
+pub(crate) fn is_selected_tls13_suite(suite: &Tls13CipherSuite) -> bool {
+    // Trait-object vtables can be duplicated across dependent crate builds, so
+    // selection compares the adapter data addresses and intentionally ignores
+    // their metadata.
+    (same_aead_adapter(suite.aead_alg, &AWS_LC_AES_128_GCM)
+        && same_hkdf_adapter(suite.hkdf_provider, &AWS_LC_HKDF_SHA256))
+        || (same_aead_adapter(suite.aead_alg, &AWS_LC_AES_256_GCM)
+            && same_hkdf_adapter(suite.hkdf_provider, &AWS_LC_HKDF_SHA384))
+        || (same_aead_adapter(suite.aead_alg, &AWS_LC_CHACHA20_POLY1305)
+            && same_hkdf_adapter(suite.hkdf_provider, &AWS_LC_HKDF_SHA256))
+}
 
 /// The TLS1.3 ciphersuite TLS_CHACHA20_POLY1305_SHA256
 pub static TLS13_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
@@ -28,8 +65,8 @@ pub(crate) static TLS13_CHACHA20_POLY1305_SHA256_INTERNAL: &Tls13CipherSuite = &
         // ref: <https://www.ietf.org/archive/id/draft-irtf-cfrg-aead-limits-08.html#section-5.2.1>
         confidentiality_limit: u64::MAX,
     },
-    hkdf_provider: &AwsLcHkdf(hkdf::HKDF_SHA256, hmac::HMAC_SHA256),
-    aead_alg: &Chacha20Poly1305Aead(AeadAlgorithm(&aead::CHACHA20_POLY1305)),
+    hkdf_provider: &AWS_LC_HKDF_SHA256,
+    aead_alg: &AWS_LC_CHACHA20_POLY1305,
     quic: Some(&super::quic::KeyBuilder {
         packet_alg: &aead::CHACHA20_POLY1305,
         header_alg: &aead::quic::CHACHA20,
@@ -42,23 +79,25 @@ pub(crate) static TLS13_CHACHA20_POLY1305_SHA256_INTERNAL: &Tls13CipherSuite = &
 
 /// The TLS1.3 ciphersuite TLS_AES_256_GCM_SHA384
 pub static TLS13_AES_256_GCM_SHA384: SupportedCipherSuite =
-    SupportedCipherSuite::Tls13(&Tls13CipherSuite {
-        common: CipherSuiteCommon {
-            suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
-            hash_provider: &super::hash::SHA384,
-            confidentiality_limit: 1 << 24,
-        },
-        hkdf_provider: &AwsLcHkdf(hkdf::HKDF_SHA384, hmac::HMAC_SHA384),
-        aead_alg: &Aes256GcmAead(AeadAlgorithm(&aead::AES_256_GCM)),
-        quic: Some(&super::quic::KeyBuilder {
-            packet_alg: &aead::AES_256_GCM,
-            header_alg: &aead::quic::AES_256,
-            // ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-b.1.1>
-            confidentiality_limit: 1 << 23,
-            // ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-b.1.2>
-            integrity_limit: 1 << 52,
-        }),
-    });
+    SupportedCipherSuite::Tls13(TLS13_AES_256_GCM_SHA384_INTERNAL);
+
+pub(crate) static TLS13_AES_256_GCM_SHA384_INTERNAL: &Tls13CipherSuite = &Tls13CipherSuite {
+    common: CipherSuiteCommon {
+        suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
+        hash_provider: &super::hash::SHA384,
+        confidentiality_limit: 1 << 24,
+    },
+    hkdf_provider: &AWS_LC_HKDF_SHA384,
+    aead_alg: &AWS_LC_AES_256_GCM,
+    quic: Some(&super::quic::KeyBuilder {
+        packet_alg: &aead::AES_256_GCM,
+        header_alg: &aead::quic::AES_256,
+        // ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-b.1.1>
+        confidentiality_limit: 1 << 23,
+        // ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-b.1.2>
+        integrity_limit: 1 << 52,
+    }),
+};
 
 /// The TLS1.3 ciphersuite TLS_AES_128_GCM_SHA256
 pub static TLS13_AES_128_GCM_SHA256: SupportedCipherSuite =
@@ -70,8 +109,8 @@ pub(crate) static TLS13_AES_128_GCM_SHA256_INTERNAL: &Tls13CipherSuite = &Tls13C
         hash_provider: &super::hash::SHA256,
         confidentiality_limit: 1 << 24,
     },
-    hkdf_provider: &AwsLcHkdf(hkdf::HKDF_SHA256, hmac::HMAC_SHA256),
-    aead_alg: &Aes128GcmAead(AeadAlgorithm(&aead::AES_128_GCM)),
+    hkdf_provider: &AWS_LC_HKDF_SHA256,
+    aead_alg: &AWS_LC_AES_128_GCM,
     quic: Some(&super::quic::KeyBuilder {
         packet_alg: &aead::AES_128_GCM,
         header_alg: &aead::quic::AES_128,
@@ -105,6 +144,12 @@ impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
         self.0.key_len()
     }
 
+    fn record_limits(&self) -> verus_tls13_record::ProviderLimits {
+        verus_tls13_record::ProviderLimits::aws_lc(
+            verus_tls13_record::AwsLcSuite::Chacha20Poly1305Sha256,
+        )
+    }
+
     fn extract_keys(
         &self,
         key: AeadKey,
@@ -133,6 +178,10 @@ impl Tls13AeadAlgorithm for Aes256GcmAead {
         self.0.key_len()
     }
 
+    fn record_limits(&self) -> verus_tls13_record::ProviderLimits {
+        verus_tls13_record::ProviderLimits::aws_lc(verus_tls13_record::AwsLcSuite::Aes256GcmSha384)
+    }
+
     fn extract_keys(
         &self,
         key: AeadKey,
@@ -159,6 +208,10 @@ impl Tls13AeadAlgorithm for Aes128GcmAead {
 
     fn key_len(&self) -> usize {
         self.0.key_len()
+    }
+
+    fn record_limits(&self) -> verus_tls13_record::ProviderLimits {
+        verus_tls13_record::ProviderLimits::aws_lc(verus_tls13_record::AwsLcSuite::Aes128GcmSha256)
     }
 
     fn extract_keys(
@@ -235,9 +288,10 @@ impl MessageEncrypter for AeadMessageEncrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(total_len));
-        payload.extend_from_chunks(&msg.payload);
-        payload.extend_from_slice(&msg.typ.to_array());
+        let aad = aead::Aad::from(
+            verus_tls13_record::protected_header(total_len).map_err(|_| Error::EncryptError)?,
+        );
+        encode_inner(&mut payload, &msg)?;
 
         self.enc_key
             .seal_in_place_append_tag(nonce, aad, &mut payload)
@@ -263,21 +317,21 @@ impl MessageDecrypter for AeadMessageDecrypter {
         mut msg: InboundOpaqueMessage<'a>,
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error> {
+        let aad = received_aad(&msg)?;
         let payload = &mut msg.payload;
         if payload.len() < self.dec_key.algorithm().tag_len() {
             return Err(Error::DecryptError);
         }
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(payload.len()));
+        let aad = aead::Aad::from(aad);
         let plain_len = self
             .dec_key
             .open_in_place(nonce, aad, payload)
             .map_err(|_| Error::DecryptError)?
             .len();
 
-        payload.truncate(plain_len);
-        msg.into_tls13_unpadded_message()
+        decode_inner(msg, plain_len)
     }
 }
 
@@ -296,9 +350,10 @@ impl MessageEncrypter for GcmMessageEncrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(total_len));
-        payload.extend_from_chunks(&msg.payload);
-        payload.extend_from_slice(&msg.typ.to_array());
+        let aad = aead::Aad::from(
+            verus_tls13_record::protected_header(total_len).map_err(|_| Error::EncryptError)?,
+        );
+        encode_inner(&mut payload, &msg)?;
 
         self.enc_key
             .seal_in_place_append_tag(nonce, aad, &mut payload)
@@ -327,22 +382,61 @@ impl MessageDecrypter for GcmMessageDecrypter {
         mut msg: InboundOpaqueMessage<'a>,
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error> {
+        let aad = received_aad(&msg)?;
         let payload = &mut msg.payload;
         if payload.len() < self.dec_key.algorithm().tag_len() {
             return Err(Error::DecryptError);
         }
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(payload.len()));
+        let aad = aead::Aad::from(aad);
         let plain_len = self
             .dec_key
             .open_in_place(nonce, aad, payload)
             .map_err(|_| Error::DecryptError)?
             .len();
 
-        payload.truncate(plain_len);
-        msg.into_tls13_unpadded_message()
+        decode_inner(msg, plain_len)
     }
+}
+
+fn received_aad(msg: &InboundOpaqueMessage<'_>) -> Result<[u8; 5], Error> {
+    let version = msg.version.to_array();
+    verus_tls13_record::received_protected_header(
+        msg.typ.to_array()[0],
+        u16::from_be_bytes(version),
+        msg.payload.len(),
+    )
+    .map_err(|_| Error::DecryptError)
+}
+
+fn encode_inner(
+    payload: &mut PrefixedPayload,
+    msg: &OutboundPlainMessage<'_>,
+) -> Result<(), Error> {
+    let content_len = msg.payload.len();
+    payload.extend_from_chunks(&msg.payload);
+    payload.extend_from_slice(&[0]);
+    verus_tls13_record::encode_inner(payload.as_mut(), content_len, msg.typ.to_array()[0])
+        .map_err(|_| Error::EncryptError)?;
+    debug_assert_eq!(payload.as_ref()[content_len], msg.typ.to_array()[0]);
+    Ok(())
+}
+
+fn decode_inner<'a>(
+    mut msg: InboundOpaqueMessage<'a>,
+    plain_len: usize,
+) -> Result<InboundPlainMessage<'a>, Error> {
+    msg.payload.truncate(plain_len);
+    let decoded = verus_tls13_record::decode_inner(&msg.payload).map_err(|error| match error {
+        verus_tls13_record::InnerError::MessageTooLarge => Error::PeerSentOversizedRecord,
+        _ => PeerMisbehaved::IllegalTlsInnerPlaintext.into(),
+    })?;
+    msg.typ = ContentType::from(decoded.content_type);
+    msg.version = ProtocolVersion::TLSv1_3;
+    msg.payload
+        .truncate(decoded.content_len);
+    Ok(msg.into_plain_message())
 }
 
 struct AwsLcHkdf(hkdf::Algorithm, hmac::Algorithm);
@@ -421,5 +515,43 @@ struct Len(usize);
 impl KeyType for Len {
     fn len(&self) -> usize {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_profile_requires_aws_lc_components() {
+        assert!(is_selected_tls13_suite(TLS13_AES_128_GCM_SHA256_INTERNAL));
+        assert!(is_selected_tls13_suite(TLS13_AES_256_GCM_SHA384_INTERNAL));
+        assert!(is_selected_tls13_suite(
+            TLS13_CHACHA20_POLY1305_SHA256_INTERNAL
+        ));
+
+        let copied = Tls13CipherSuite {
+            common: CipherSuiteCommon {
+                suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                hash_provider: &crypto::aws_lc_rs::hash::SHA256,
+                confidentiality_limit: 1024,
+            },
+            hkdf_provider: TLS13_AES_128_GCM_SHA256_INTERNAL.hkdf_provider,
+            aead_alg: TLS13_AES_128_GCM_SHA256_INTERNAL.aead_alg,
+            quic: TLS13_AES_128_GCM_SHA256_INTERNAL.quic,
+        };
+        assert!(is_selected_tls13_suite(&copied));
+
+        let non_selected = Tls13CipherSuite {
+            common: CipherSuiteCommon {
+                suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                hash_provider: &crypto::aws_lc_rs::hash::SHA256,
+                confidentiality_limit: 1 << 24,
+            },
+            hkdf_provider: &AWS_LC_HKDF_SHA384,
+            aead_alg: &AWS_LC_AES_128_GCM,
+            quic: TLS13_AES_128_GCM_SHA256_INTERNAL.quic,
+        };
+        assert!(!is_selected_tls13_suite(&non_selected));
     }
 }

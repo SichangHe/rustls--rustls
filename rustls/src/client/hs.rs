@@ -242,6 +242,7 @@ fn emit_client_hello_for_retry(
     };
 
     if supported_versions.tls13 {
+        exts.record_size_limit = config.record_size_limit;
         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
             exts.certificate_authority_names = Some(cas_extension.to_owned());
         }

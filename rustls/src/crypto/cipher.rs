@@ -24,6 +24,14 @@ pub trait Tls13AeadAlgorithm: Send + Sync {
     /// The length of key in bytes required by `encrypter()` and `decrypter()`.
     fn key_len(&self) -> usize;
 
+    /// Provider-approved record, byte, failed-open, and expansion bounds.
+    ///
+    /// The default preserves compatibility for providers outside the selected
+    /// AWS-LC profile.  Selected-profile providers override this contract.
+    fn record_limits(&self) -> verus_tls13_record::ProviderLimits {
+        verus_tls13_record::ProviderLimits::legacy(u64::MAX - 1, 16)
+    }
+
     /// Convert the key material from `key`/`iv`, into a `ConnectionTrafficSecrets` item.
     ///
     /// May return [`UnsupportedOperationError`] if the AEAD algorithm is not a supported
@@ -213,9 +221,7 @@ impl Nonce {
     /// This is `iv ^ seq` where `seq` is encoded as a 96-bit big-endian integer.
     #[inline]
     pub fn new(iv: &Iv, seq: u64) -> Self {
-        let mut seq_bytes = [0u8; NONCE_LEN];
-        codec::put_u64(seq, &mut seq_bytes[4..]);
-        Self::new_from_seq(iv, seq_bytes)
+        Self(verus_tls13_record::nonce(iv.0, seq))
     }
 
     /// Creates a unique nonce based on the `iv`, the packet number `pn` and multipath `path_id`.

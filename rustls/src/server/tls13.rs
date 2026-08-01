@@ -697,6 +697,16 @@ mod client_hello {
         let mut ep = hs::ExtensionProcessing::new(extra_exts);
         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
 
+        if let Some(peer_limit) = hello.record_size_limit {
+            cx.common
+                .set_record_size_limits(Some(peer_limit), config.record_size_limit)
+                .map_err(|error| {
+                    cx.common
+                        .send_fatal_alert(AlertDescription::IllegalParameter, error)
+                })?;
+            ep.extensions.record_size_limit = config.record_size_limit;
+        }
+
         // RFC 9149: echo the expected ticket count if the client sent the extension.
         if hello.ticket_request.is_some() && config.max_tls13_tickets > 0 {
             ep.extensions.ticket_request = Some(ServerTicketRequestHint {
@@ -1423,12 +1433,12 @@ impl ExpectTraffic {
 
         if common.should_update_key(key_update_request)? {
             self.key_schedule
-                .update_encrypter_and_notify(common);
+                .update_encrypter_and_notify(common)?;
         }
 
         // Update our read-side keys.
         self.key_schedule
-            .update_decrypter(common);
+            .update_decrypter(common)?;
         Ok(())
     }
 }

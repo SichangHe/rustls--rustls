@@ -1,10 +1,12 @@
 use alloc::boxed::Box;
 use core::cmp::min;
 
+use crate::ContentType;
 use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
 use crate::error::Error;
 use crate::log::trace;
 use crate::msgs::message::{InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage};
+use verus_tls13_record::{DirectionalLimits, ProviderLimits, TrafficEpoch, UsageError};
 
 #[derive(PartialEq)]
 enum DirectionState {
@@ -22,9 +24,11 @@ enum DirectionState {
 pub(crate) struct RecordLayer {
     message_encrypter: Box<dyn MessageEncrypter>,
     message_decrypter: Box<dyn MessageDecrypter>,
-    write_seq_max: u64,
-    write_seq: u64,
-    read_seq: u64,
+    write_usage: TrafficEpoch,
+    read_usage: TrafficEpoch,
+    directional_limits: DirectionalLimits,
+    write_selected_tls13: bool,
+    read_selected_tls13: bool,
     has_decrypted: bool,
     encrypt_state: DirectionState,
     decrypt_state: DirectionState,
@@ -41,9 +45,11 @@ impl RecordLayer {
         Self {
             message_encrypter: <dyn MessageEncrypter>::invalid(),
             message_decrypter: <dyn MessageDecrypter>::invalid(),
-            write_seq_max: 0,
-            write_seq: 0,
-            read_seq: 0,
+            write_usage: TrafficEpoch::new(),
+            read_usage: TrafficEpoch::new(),
+            directional_limits: DirectionalLimits::default(),
+            write_selected_tls13: false,
+            read_selected_tls13: false,
             has_decrypted: false,
             encrypt_state: DirectionState::Invalid,
             decrypt_state: DirectionState::Invalid,
@@ -67,6 +73,10 @@ impl RecordLayer {
             }));
         }
 
+        if self.read_selected_tls13 && encr.typ != ContentType::ApplicationData {
+            return Err(Error::DecryptError);
+        }
+
         // Set to `true` if the peer appears to getting close to encrypting
         // too many messages with this key.
         //
@@ -75,15 +85,30 @@ impl RecordLayer {
         //
         // Note that there's no reason to refuse to decrypt: the security
         // failure has already happened.
-        let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
+        let want_close_before_decrypt = self.read_usage.sequence() == SEQ_SOFT_LIMIT;
 
         let encrypted_len = encr.payload.len();
+        let permit = if self.read_selected_tls13 {
+            self.read_usage
+                .permit_open(
+                    encrypted_len,
+                    self.directional_limits
+                        .receive_inner_limit,
+                )
+                .map_err(map_open_usage_error)?
+        } else {
+            self.read_usage
+                .permit_legacy_open(encrypted_len)
+                .map_err(map_open_usage_error)?
+        };
         match self
             .message_decrypter
-            .decrypt(encr, self.read_seq)
+            .decrypt(encr, permit.sequence)
         {
             Ok(plaintext) => {
-                self.read_seq += 1;
+                self.read_usage
+                    .commit_open(permit)
+                    .map_err(|_| Error::DecryptError)?;
                 if !self.has_decrypted {
                     self.has_decrypted = true;
                 }
@@ -96,7 +121,10 @@ impl RecordLayer {
                 trace!("Dropping undecryptable message after aborted early_data");
                 Ok(None)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let _ = self.read_usage.fail_open(permit);
+                Err(err)
+            }
         }
     }
 
@@ -107,26 +135,80 @@ impl RecordLayer {
     pub(crate) fn encrypt_outgoing(
         &mut self,
         plain: OutboundPlainMessage<'_>,
-    ) -> OutboundOpaqueMessage {
-        debug_assert!(self.encrypt_state == DirectionState::Active);
-        assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
-        let seq = self.write_seq;
-        self.write_seq += 1;
-        self.message_encrypter
-            .encrypt(plain, seq)
-            .unwrap()
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        if self.encrypt_state != DirectionState::Active {
+            return Err(Error::EncryptError);
+        }
+        let ciphertext_len = self
+            .message_encrypter
+            .encrypted_payload_len(plain.payload.len());
+        let sequence = if self.write_selected_tls13 {
+            let inner_len = plain
+                .payload
+                .len()
+                .checked_add(1)
+                .ok_or(Error::EncryptError)?;
+            match self.write_usage.issue_seal(
+                inner_len,
+                ciphertext_len,
+                self.directional_limits.send_inner_limit,
+            ) {
+                Ok(sequence) => sequence,
+                Err(_) => {
+                    self.write_usage.fail_seal();
+                    return Err(Error::EncryptError);
+                }
+            }
+        } else {
+            match self
+                .write_usage
+                .issue_legacy_seal(ciphertext_len)
+            {
+                Ok(sequence) => sequence,
+                Err(_) => return Err(Error::EncryptError),
+            }
+        };
+        match self
+            .message_encrypter
+            .encrypt(plain, sequence)
+        {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                if self.write_selected_tls13 {
+                    self.write_usage.fail_seal();
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
+    #[cfg(feature = "tls12")]
     pub(crate) fn prepare_message_encrypter(
         &mut self,
         cipher: Box<dyn MessageEncrypter>,
         max_messages: u64,
     ) {
         self.message_encrypter = cipher;
-        self.write_seq = 0;
-        self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
+        let _ = self
+            .write_usage
+            .prepare(ProviderLimits::legacy(min(SEQ_SOFT_LIMIT, max_messages), 0));
+        self.write_selected_tls13 = false;
+        self.encrypt_state = DirectionState::Prepared;
+    }
+
+    pub(crate) fn prepare_tls13_message_encrypter(
+        &mut self,
+        cipher: Box<dyn MessageEncrypter>,
+        provider_limits: ProviderLimits,
+        selected_aws_lc_profile: bool,
+    ) {
+        let limits =
+            provider_limits.with_max_records(min(SEQ_SOFT_LIMIT, provider_limits.max_records));
+        self.message_encrypter = cipher;
+        let _ = self.write_usage.prepare(limits);
+        self.write_selected_tls13 = selected_aws_lc_profile;
         self.encrypt_state = DirectionState::Prepared;
     }
 
@@ -134,7 +216,22 @@ impl RecordLayer {
     /// It is not used until you call `start_decrypting`.
     pub(crate) fn prepare_message_decrypter(&mut self, cipher: Box<dyn MessageDecrypter>) {
         self.message_decrypter = cipher;
-        self.read_seq = 0;
+        let _ = self
+            .read_usage
+            .prepare(ProviderLimits::legacy(u64::MAX - 1, 0));
+        self.read_selected_tls13 = false;
+        self.decrypt_state = DirectionState::Prepared;
+    }
+
+    pub(crate) fn prepare_tls13_message_decrypter(
+        &mut self,
+        cipher: Box<dyn MessageDecrypter>,
+        provider_limits: ProviderLimits,
+        selected_aws_lc_profile: bool,
+    ) {
+        self.message_decrypter = cipher;
+        let _ = self.read_usage.prepare(provider_limits);
+        self.read_selected_tls13 = selected_aws_lc_profile;
         self.decrypt_state = DirectionState::Prepared;
     }
 
@@ -142,6 +239,7 @@ impl RecordLayer {
     /// call to `prepare_message_encrypter`.
     pub(crate) fn start_encrypting(&mut self) {
         debug_assert!(self.encrypt_state == DirectionState::Prepared);
+        let _ = self.write_usage.activate();
         self.encrypt_state = DirectionState::Active;
     }
 
@@ -149,37 +247,51 @@ impl RecordLayer {
     /// call to `prepare_message_decrypter`.
     pub(crate) fn start_decrypting(&mut self) {
         debug_assert!(self.decrypt_state == DirectionState::Prepared);
+        let _ = self.read_usage.activate();
         self.decrypt_state = DirectionState::Active;
     }
 
-    /// Set and start using the given `MessageEncrypter` for future outgoing
-    /// message encryption.
-    pub(crate) fn set_message_encrypter(
+    pub(crate) fn set_tls13_message_encrypter(
         &mut self,
         cipher: Box<dyn MessageEncrypter>,
-        max_messages: u64,
+        provider_limits: ProviderLimits,
+        selected_aws_lc_profile: bool,
     ) {
-        self.prepare_message_encrypter(cipher, max_messages);
+        self.prepare_tls13_message_encrypter(cipher, provider_limits, selected_aws_lc_profile);
         self.start_encrypting();
     }
 
-    /// Set and start using the given `MessageDecrypter` for future incoming
-    /// message decryption.
-    pub(crate) fn set_message_decrypter(&mut self, cipher: Box<dyn MessageDecrypter>) {
-        self.prepare_message_decrypter(cipher);
+    pub(crate) fn set_tls13_message_decrypter(
+        &mut self,
+        cipher: Box<dyn MessageDecrypter>,
+        provider_limits: ProviderLimits,
+        selected_aws_lc_profile: bool,
+    ) {
+        self.prepare_tls13_message_decrypter(cipher, provider_limits, selected_aws_lc_profile);
         self.start_decrypting();
         self.trial_decryption_len = None;
+    }
+
+    pub(crate) fn set_directional_limits(&mut self, limits: DirectionalLimits) {
+        self.directional_limits = limits;
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        self.write_usage.terminate();
+        self.read_usage.terminate();
     }
 
     /// Set and start using the given `MessageDecrypter` for future incoming
     /// message decryption, and enable "trial decryption" mode for when TLS1.3
     /// 0-RTT is attempted but rejected by the server.
-    pub(crate) fn set_message_decrypter_with_trial_decryption(
+    pub(crate) fn set_tls13_message_decrypter_with_trial_decryption(
         &mut self,
         cipher: Box<dyn MessageDecrypter>,
+        provider_limits: ProviderLimits,
+        selected_aws_lc_profile: bool,
         max_length: usize,
     ) {
-        self.prepare_message_decrypter(cipher);
+        self.prepare_tls13_message_decrypter(cipher, provider_limits, selected_aws_lc_profile);
         self.start_decrypting();
         self.trial_decryption_len = Some(max_length);
     }
@@ -197,15 +309,35 @@ impl RecordLayer {
     /// `add` is added to the current sequence number.  `add` as `0` means
     /// "the next message processed by `encrypt_outgoing`"
     pub(crate) fn pre_encrypt_action(&self, add: u64) -> PreEncryptAction {
-        match self.write_seq.saturating_add(add) {
-            v if v == self.write_seq_max => PreEncryptAction::RefreshOrClose,
-            SEQ_HARD_LIMIT.. => PreEncryptAction::Refuse,
-            _ => PreEncryptAction::Nothing,
+        let records = self
+            .write_usage
+            .records()
+            .saturating_add(add);
+        let max_records = self.write_usage.max_records();
+        if records >= max_records || self.write_usage.sequence() >= SEQ_HARD_LIMIT {
+            PreEncryptAction::Refuse
+        } else if records.saturating_add(1) >= max_records
+            || (self.write_selected_tls13 && records.saturating_add(2) >= max_records)
+            || self.write_usage.sequence() == SEQ_SOFT_LIMIT
+        {
+            PreEncryptAction::RefreshOrClose
+        } else {
+            PreEncryptAction::Nothing
         }
     }
 
     pub(crate) fn is_encrypting(&self) -> bool {
         self.encrypt_state == DirectionState::Active
+    }
+
+    /// Whether an active inbound epoch accepts selected-profile protected records.
+    pub(crate) fn accepts_selected_tls13_protected_records(&self) -> bool {
+        self.read_selected_tls13 && self.decrypt_state == DirectionState::Active
+    }
+
+    /// Whether either traffic direction uses the selected AWS-LC TLS 1.3 profile.
+    pub(crate) fn uses_selected_tls13(&self) -> bool {
+        self.write_selected_tls13 || self.read_selected_tls13
     }
 
     /// Return true if we have ever decrypted a message. This is used in place
@@ -215,11 +347,11 @@ impl RecordLayer {
     }
 
     pub(crate) fn write_seq(&self) -> u64 {
-        self.write_seq
+        self.write_usage.sequence()
     }
 
     pub(crate) fn read_seq(&self) -> u64 {
-        self.read_seq
+        self.read_usage.sequence()
     }
 
     pub(crate) fn encrypted_len(&self, payload_len: usize) -> usize {
@@ -238,6 +370,13 @@ impl RecordLayer {
             }
             _ => false,
         }
+    }
+}
+
+fn map_open_usage_error(error: UsageError) -> Error {
+    match error {
+        UsageError::InvalidLength | UsageError::DirectionalLimit => Error::PeerSentOversizedRecord,
+        _ => Error::DecryptError,
     }
 }
 
@@ -294,7 +433,7 @@ mod tests {
             record_layer.decrypt_state,
             DirectionState::Invalid
         ));
-        assert_eq!(record_layer.read_seq, 0);
+        assert_eq!(record_layer.read_usage.sequence(), 0);
         assert!(!record_layer.has_decrypted());
 
         // Preparing the record layer should update the decrypt state, but shouldn't affect whether it
@@ -304,13 +443,13 @@ mod tests {
             record_layer.decrypt_state,
             DirectionState::Prepared
         ));
-        assert_eq!(record_layer.read_seq, 0);
+        assert_eq!(record_layer.read_usage.sequence(), 0);
         assert!(!record_layer.has_decrypted());
 
         // Starting decryption should update the decrypt state, but not affect whether it has decrypted.
         record_layer.start_decrypting();
         assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
-        assert_eq!(record_layer.read_seq, 0);
+        assert_eq!(record_layer.read_usage.sequence(), 0);
         assert!(!record_layer.has_decrypted());
 
         // Decrypting a message should update the read_seq and track that we have now performed
@@ -323,14 +462,55 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
-        assert_eq!(record_layer.read_seq, 1);
+        assert_eq!(record_layer.read_usage.sequence(), 1);
         assert!(record_layer.has_decrypted());
 
         // Resetting the record layer message decrypter (as if a key update occurred) should reset
         // the read_seq number, but not our knowledge of whether we have decrypted previously.
-        record_layer.set_message_decrypter(Box::new(PassThroughDecrypter));
+        record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypter));
+        record_layer.start_decrypting();
         assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
-        assert_eq!(record_layer.read_seq, 0);
+        assert_eq!(record_layer.read_usage.sequence(), 0);
         assert!(record_layer.has_decrypted());
+    }
+
+    #[test]
+    fn selected_trial_decryption_uses_an_active_selected_read_epoch() {
+        use crate::{ContentType, ProtocolVersion};
+        use verus_tls13_record::AwsLcSuite;
+
+        struct PassThroughDecrypter;
+        impl MessageDecrypter for PassThroughDecrypter {
+            fn decrypt<'a>(
+                &mut self,
+                m: InboundOpaqueMessage<'a>,
+                _: u64,
+            ) -> Result<InboundPlainMessage<'a>, Error> {
+                Ok(m.into_plain_message())
+            }
+        }
+
+        let mut record_layer = RecordLayer::new();
+        assert!(!record_layer.accepts_selected_tls13_protected_records());
+
+        record_layer.set_tls13_message_decrypter_with_trial_decryption(
+            Box::new(PassThroughDecrypter),
+            ProviderLimits::aws_lc(AwsLcSuite::Aes128GcmSha256),
+            true,
+            1024,
+        );
+
+        assert!(record_layer.accepts_selected_tls13_protected_records());
+        assert!(record_layer.read_selected_tls13);
+        assert_eq!(record_layer.trial_decryption_len, Some(1024));
+        assert!(
+            record_layer
+                .decrypt_incoming(InboundOpaqueMessage::new(
+                    ContentType::ApplicationData,
+                    ProtocolVersion::TLSv1_2,
+                    &mut [0u8; 17],
+                ))
+                .is_ok()
+        );
     }
 }

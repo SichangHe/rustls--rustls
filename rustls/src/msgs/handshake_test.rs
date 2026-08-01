@@ -842,6 +842,7 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
             transport_parameters_draft: None,
             client_certificate_type: Some(CertificateType::RawPublicKey),
             server_certificate_type: Some(CertificateType::RawPublicKey),
+            record_size_limit: None,
             unknown_extensions: Default::default(),
         }),
     }

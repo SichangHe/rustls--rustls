@@ -84,6 +84,10 @@ impl<'a> Reader<'a> {
     pub fn left(&self) -> usize {
         self.buffer.len() - self.cursor
     }
+
+    pub(crate) fn remaining(&self) -> &'a [u8] {
+        &self.buffer[self.cursor..]
+    }
 }
 
 /// Trait for implementing encoding and decoding functionality

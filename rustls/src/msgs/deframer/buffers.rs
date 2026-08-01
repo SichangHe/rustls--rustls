@@ -5,7 +5,12 @@ use core::ops::Range;
 use std::io;
 
 #[cfg(feature = "std")]
-use crate::msgs::message::MAX_WIRE_SIZE;
+use verus_tls13_record::MAX_WIRE_LEN;
+
+/// The handshake deframer may retain a complete 64KiB handshake message
+/// assembled from individually bounded TLS records.
+#[cfg(feature = "std")]
+const MAX_BUFFERED_HANDSHAKE_LEN: usize = 0xffff;
 
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
@@ -212,11 +217,6 @@ impl DeframerVecBuffer {
 
     /// Resize the internal `buf` if necessary for reading more bytes.
     fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
-        /// TLS allows for handshake messages of up to 16MB.  We
-        /// restrict that to 64KB to limit potential for denial-of-
-        /// service.
-        const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
-
         const READ_SIZE: usize = 4096;
 
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
@@ -227,8 +227,8 @@ impl DeframerVecBuffer {
         // the same flight have been consumed, `pop()` will call `discard()` to reset `used`.
         // At this point, the buffer resizing logic below should reduce the buffer size.
         let allow_max = match is_joining_hs {
-            true => MAX_HANDSHAKE_SIZE as usize,
-            false => MAX_WIRE_SIZE,
+            true => MAX_BUFFERED_HANDSHAKE_LEN,
+            false => MAX_WIRE_LEN,
         };
 
         if self.used >= allow_max {
@@ -236,7 +236,7 @@ impl DeframerVecBuffer {
         }
 
         // If we can and need to increase the buffer size to allow a 4k read, do so. After
-        // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
+        // dealing with a large handshake message,
         // make sure to reduce the buffer size again (large messages should be rare).
         // Also, reduce the buffer size if there are neither full nor partial messages in it,
         // which usually means that the other side suspended sending data.
