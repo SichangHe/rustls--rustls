@@ -356,6 +356,23 @@ mod client_hello {
 
             let full_handshake = resumedata.is_none();
             self.transcript.add_message(chm);
+
+            if let (Some(peer_limit), Some(local_limit)) = (
+                client_hello.record_size_limit,
+                self.config.record_size_limit,
+            ) {
+                let send_inner_limit = verus_tls13_record::Limit::new(usize::from(peer_limit))
+                .map_err(|_| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::InvalidRecordSizeLimit,
+                    )
+                })?;
+                cx.common.set_tls13_record_limits(
+                    send_inner_limit,
+                    local_limit.into_inner(),
+                )?;
+            }
             let key_schedule = emit_server_hello(
                 &mut self.transcript,
                 &self.randoms,
@@ -696,6 +713,10 @@ mod client_hello {
     ) -> Result<EarlyDataDecision, Error> {
         let mut ep = hs::ExtensionProcessing::new(extra_exts);
         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
+
+        if hello.record_size_limit.is_some() {
+            ep.extensions.record_size_limit = config.record_size_limit.map(|limit| limit.get());
+        }
 
         // RFC 9149: echo the expected ticket count if the client sent the extension.
         if hello.ticket_request.is_some() && config.max_tls13_tickets > 0 {
@@ -1350,9 +1371,9 @@ impl State<ServerConnectionData> for ExpectFinished {
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 
         let handshake_hash = self.transcript.current_hash();
-        let (key_schedule_before_finished, expect_verify_data) = self
+        let expect_verify_data = self
             .key_schedule
-            .sign_client_finish(&handshake_hash, cx.common);
+            .expected_client_finish(&handshake_hash);
 
         let fin = match ConstantTimeEq::ct_eq(expect_verify_data.as_ref(), finished.bytes()).into()
         {
@@ -1363,6 +1384,9 @@ impl State<ServerConnectionData> for ExpectFinished {
                     .send_fatal_alert(AlertDescription::DecryptError, Error::DecryptError));
             }
         };
+
+        let key_schedule_before_finished =
+            self.key_schedule.confirm_client_finish(cx.common);
 
         // Note: future derivations include Client Finished, but not the
         // main application data keying.
@@ -1421,14 +1445,15 @@ impl ExpectTraffic {
 
         common.check_aligned_handshake()?;
 
-        if common.should_update_key(key_update_request)? {
-            self.key_schedule
-                .update_encrypter_and_notify(common);
-        }
+        let should_respond = common.should_update_key(key_update_request)?;
 
-        // Update our read-side keys.
         self.key_schedule
-            .update_decrypter(common);
+            .update_decrypter(common, key_update_request)?;
+
+        if should_respond {
+            self.key_schedule
+                .update_encrypter_and_notify(common)?;
+        }
         Ok(())
     }
 }

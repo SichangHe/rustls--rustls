@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use aws_lc_rs::hkdf::KeyType;
 use aws_lc_rs::{aead, hkdf, hmac};
@@ -16,12 +17,16 @@ use crate::msgs::message::{
 };
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets, SupportedCipherSuite};
 use crate::tls13::Tls13CipherSuite;
+use verus_tls13_record::{Aead as TlsrecAead, ProviderError as TlsrecProviderError};
 
 /// The TLS1.3 ciphersuite TLS_CHACHA20_POLY1305_SHA256
 pub static TLS13_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls13(TLS13_CHACHA20_POLY1305_SHA256_INTERNAL);
 
-pub(crate) static TLS13_CHACHA20_POLY1305_SHA256_INTERNAL: &Tls13CipherSuite = &Tls13CipherSuite {
+pub(crate) static TLS13_CHACHA20_POLY1305_SHA256_INTERNAL: &Tls13CipherSuite =
+    &TLS13_CHACHA20_POLY1305_SHA256_OBJECT;
+
+static TLS13_CHACHA20_POLY1305_SHA256_OBJECT: Tls13CipherSuite = Tls13CipherSuite {
     common: CipherSuiteCommon {
         suite: CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
         hash_provider: &super::hash::SHA256,
@@ -42,7 +47,12 @@ pub(crate) static TLS13_CHACHA20_POLY1305_SHA256_INTERNAL: &Tls13CipherSuite = &
 
 /// The TLS1.3 ciphersuite TLS_AES_256_GCM_SHA384
 pub static TLS13_AES_256_GCM_SHA384: SupportedCipherSuite =
-    SupportedCipherSuite::Tls13(&Tls13CipherSuite {
+    SupportedCipherSuite::Tls13(TLS13_AES_256_GCM_SHA384_INTERNAL);
+
+pub(crate) static TLS13_AES_256_GCM_SHA384_INTERNAL: &Tls13CipherSuite =
+    &TLS13_AES_256_GCM_SHA384_OBJECT;
+
+static TLS13_AES_256_GCM_SHA384_OBJECT: Tls13CipherSuite = Tls13CipherSuite {
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
             hash_provider: &super::hash::SHA384,
@@ -58,13 +68,16 @@ pub static TLS13_AES_256_GCM_SHA384: SupportedCipherSuite =
             // ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-b.1.2>
             integrity_limit: 1 << 52,
         }),
-    });
+    };
 
 /// The TLS1.3 ciphersuite TLS_AES_128_GCM_SHA256
 pub static TLS13_AES_128_GCM_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls13(TLS13_AES_128_GCM_SHA256_INTERNAL);
 
-pub(crate) static TLS13_AES_128_GCM_SHA256_INTERNAL: &Tls13CipherSuite = &Tls13CipherSuite {
+pub(crate) static TLS13_AES_128_GCM_SHA256_INTERNAL: &Tls13CipherSuite =
+    &TLS13_AES_128_GCM_SHA256_OBJECT;
+
+static TLS13_AES_128_GCM_SHA256_OBJECT: Tls13CipherSuite = Tls13CipherSuite {
     common: CipherSuiteCommon {
         suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
         hash_provider: &super::hash::SHA256,
@@ -176,6 +189,75 @@ impl Tls13AeadAlgorithm for Aes128GcmAead {
 
 // common encrypter/decrypter/key_len items for above Tls13AeadAlgorithm impls
 struct AeadAlgorithm(&'static aead::Algorithm);
+
+pub(crate) fn tlsrec_suite_supported(suite: &'static Tls13CipherSuite) -> bool {
+    core::ptr::eq(suite, TLS13_AES_128_GCM_SHA256_INTERNAL)
+        || core::ptr::eq(suite, TLS13_AES_256_GCM_SHA384_INTERNAL)
+        || core::ptr::eq(suite, TLS13_CHACHA20_POLY1305_SHA256_INTERNAL)
+}
+
+pub(crate) fn tlsrec_aead_from_bytes(
+    suite: &'static Tls13CipherSuite,
+    key: &[u8],
+) -> Result<Box<dyn TlsrecAead>, Error> {
+    let aws_algorithm = if core::ptr::eq(suite, TLS13_AES_128_GCM_SHA256_INTERNAL) {
+        &aead::AES_128_GCM
+    } else if core::ptr::eq(suite, TLS13_AES_256_GCM_SHA384_INTERNAL) {
+        &aead::AES_256_GCM
+    } else if core::ptr::eq(suite, TLS13_CHACHA20_POLY1305_SHA256_INTERNAL) {
+        &aead::CHACHA20_POLY1305
+    } else {
+        return Err(Error::General(
+            "cipher suite implementation is outside the verified TLS record profile".into(),
+        ));
+    };
+    let key = aead::UnboundKey::new(aws_algorithm, key)
+        .map_err(|_| Error::General("invalid verified-record AEAD key".into()))?;
+    Ok(Box::new(PrimitiveAead {
+        key: aead::LessSafeKey::new(key),
+    }))
+}
+
+struct PrimitiveAead {
+    key: aead::LessSafeKey,
+}
+
+impl TlsrecAead for PrimitiveAead {
+    fn tag_len(&self) -> usize {
+        self.key.algorithm().tag_len()
+    }
+
+    fn seal(
+        &mut self,
+        nonce: &[u8; 12],
+        aad: &[u8; 5],
+        payload: &mut Vec<u8>,
+    ) -> Result<(), TlsrecProviderError> {
+        self.key
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(*nonce),
+                aead::Aad::from(*aad),
+                payload,
+            )
+            .map_err(|_| TlsrecProviderError)
+    }
+
+    fn open(
+        &mut self,
+        nonce: &[u8; 12],
+        aad: &[u8; 5],
+        payload: &mut [u8],
+    ) -> Result<usize, TlsrecProviderError> {
+        self.key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(*nonce),
+                aead::Aad::from(*aad),
+                payload,
+            )
+            .map(|plaintext| plaintext.len())
+            .map_err(|_| TlsrecProviderError)
+    }
+}
 
 impl AeadAlgorithm {
     // using aead::TlsRecordSealingKey
@@ -421,5 +503,21 @@ struct Len(usize);
 impl KeyType for Len {
     fn len(&self) -> usize {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tlsrec_identity_tests {
+    use super::*;
+
+    #[test]
+    fn selected_suite_identity_is_exact() {
+        for suite in [
+            TLS13_AES_128_GCM_SHA256,
+            TLS13_AES_256_GCM_SHA384,
+            TLS13_CHACHA20_POLY1305_SHA256,
+        ] {
+            assert!(tlsrec_suite_supported(suite.tls13().unwrap()));
+        }
     }
 }

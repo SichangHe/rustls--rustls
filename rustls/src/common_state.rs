@@ -51,6 +51,12 @@ pub struct CommonState {
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    sendable_application_plaintext: ChunkVecBuffer,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    in_flight_application_tls: ChunkVecBuffer,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    tlsrec_outgoing_buffer_limit: Option<usize>,
     queued_key_update_message: Option<Vec<u8>>,
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
@@ -61,6 +67,18 @@ pub struct CommonState {
     pub(crate) refresh_traffic_keys_pending: bool,
     pub(crate) fips: bool,
     pub(crate) tls13_tickets_received: u32,
+    /// Peer's advertised receive limit; bounds this endpoint's sender.
+    pub(crate) tls13_send_inner_limit: verus_tls13_record::Limit,
+    /// This endpoint's advertised receive limit; bounds its receiver.
+    pub(crate) tls13_receive_inner_limit: verus_tls13_record::Limit,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    tlsrec_control: verus_tls13_record::ControlState,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    tlsrec_local_handshake: verus_tls13_record::HandshakeTracker,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    tlsrec_peer_handshake: verus_tls13_record::HandshakeReassembler,
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    tlsrec_plaintext_sender: verus_tls13_record::PlaintextSenderState,
 }
 
 impl CommonState {
@@ -86,6 +104,12 @@ impl CommonState {
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            sendable_application_plaintext: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            in_flight_application_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            tlsrec_outgoing_buffer_limit: Some(DEFAULT_BUFFER_LIMIT),
             queued_key_update_message: None,
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
@@ -94,7 +118,163 @@ impl CommonState {
             refresh_traffic_keys_pending: false,
             fips: false,
             tls13_tickets_received: 0,
+            tls13_send_inner_limit: verus_tls13_record::Limit::rfc8446(),
+            tls13_receive_inner_limit: verus_tls13_record::Limit::rfc8446(),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            tlsrec_control: verus_tls13_record::ControlState::new(),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            tlsrec_local_handshake: verus_tls13_record::HandshakeTracker::new(),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            tlsrec_peer_handshake: verus_tls13_record::HandshakeReassembler::new(),
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            tlsrec_plaintext_sender: verus_tls13_record::PlaintextSenderState::new(match side {
+                Side::Client => verus_tls13_record::EndpointRole::Client,
+                Side::Server => verus_tls13_record::EndpointRole::Server,
+            }),
         }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn observe_tlsrec_local_handshake(&mut self, message: &OutboundPlainMessage<'_>) {
+        if self.is_quic() || message.typ != ContentType::Handshake {
+            return;
+        }
+        let bytes = message.payload.to_vec();
+        let observation = self
+            .tlsrec_local_handshake
+            .observe_record(&bytes)
+            .expect("rustls emitted invalid TLS 1.3 handshake framing");
+        if let Some(milestone) = observation.milestone {
+            self.tlsrec_control
+                .observe_local_milestone(milestone)
+                .expect("rustls emitted an invalid TLS 1.3 control transition");
+        }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn queue_tlsrec_plaintext(&mut self, message: &OutboundPlainMessage<'_>) {
+        self.observe_tlsrec_local_handshake(message);
+        let payload = message.payload.to_vec();
+        let content_type = match message.typ {
+            ContentType::ChangeCipherSpec => verus_tls13_record::ContentType::ChangeCipherSpec,
+            ContentType::Alert => verus_tls13_record::ContentType::Alert,
+            ContentType::Handshake => verus_tls13_record::ContentType::Handshake,
+            ContentType::ApplicationData => verus_tls13_record::ContentType::ApplicationData,
+            _ => panic!("unsupported plaintext content type"),
+        };
+        let step = verus_tls13_record::plaintext_send_step(
+            self.tlsrec_plaintext_sender,
+            content_type,
+            payload.len(),
+            payload.first().copied(),
+        );
+        self.tlsrec_plaintext_sender = step.state;
+        let header = step
+            .result
+            .expect("rustls emitted an invalid TLS 1.3 plaintext fragment");
+        let mut wire = Vec::with_capacity(5 + payload.len());
+        wire.extend_from_slice(&header.encode());
+        wire.extend_from_slice(&payload);
+        self.sendable_tls.append(wire);
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn observe_tlsrec_peer_handshake(
+        &mut self,
+        version: ProtocolVersion,
+        fragment: &[u8],
+    ) -> Result<verus_tls13_record::HandshakeObservation, verus_tls13_record::Error> {
+        let observation = self
+            .tlsrec_peer_handshake
+            .observe_record(u16::from(version), fragment)?;
+        if let Some(milestone) = observation.milestone {
+            // Framing completion closes the compatibility-CCS window even
+            // before the semantic handshake verifies Finished.  Key
+            // activation remains separately gated by `activate_after`.
+            self.tlsrec_control.observe_peer_milestone(milestone)?;
+        }
+        Ok(observation)
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn tlsrec_peer_handshake_is_active(&self) -> bool {
+        self.tlsrec_peer_handshake.is_active()
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn tlsrec_peer_handshake_has_message(&self) -> bool {
+        self.tlsrec_peer_handshake.has_message_ready()
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn take_tlsrec_peer_handshake_message(
+        &mut self,
+    ) -> Option<verus_tls13_record::OwnedHandshakeMessage> {
+        self.tlsrec_peer_handshake.take_message()
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn activate_tlsrec_local_after(
+        &mut self,
+        expected: verus_tls13_record::HandshakeMilestone,
+    ) -> Result<(), verus_tls13_record::Error> {
+        self.tlsrec_local_handshake.activate_after(expected)
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn activate_tlsrec_peer_after(
+        &mut self,
+        expected: verus_tls13_record::HandshakeMilestone,
+    ) -> Result<(), verus_tls13_record::Error> {
+        self.tlsrec_peer_handshake.activate_after(expected)
+    }
+
+    pub(crate) fn set_tls13_record_limits(
+        &mut self,
+        send_inner_limit: verus_tls13_record::Limit,
+        receive_inner_limit: verus_tls13_record::Limit,
+    ) -> Result<(), Error> {
+        if send_inner_limit.get() > self.tls13_send_inner_limit.get()
+            || receive_inner_limit.get() > self.tls13_receive_inner_limit.get()
+        {
+            return Err(Error::General(
+                "TLS 1.3 record limits may only be tightened".into(),
+            ));
+        }
+        self.record_layer
+            .tighten_tlsrec_limits(send_inner_limit, receive_inner_limit)
+            .map_err(|error| match error {
+                verus_tls13_record::Error::RecordOverflow => Error::PeerSentOversizedRecord,
+                _ => Error::General("invalid TLS 1.3 record limit transition".into()),
+            })?;
+        self.message_fragmenter
+            .tighten_for_tls13_inner_limit(send_inner_limit);
+        self.tls13_send_inner_limit = send_inner_limit;
+        self.tls13_receive_inner_limit = receive_inner_limit;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn begin_tls13_receive_limit_offer(
+        &mut self,
+        limit: verus_tls13_record::Limit,
+    ) {
+        if !self.is_quic() {
+            self.record_layer.begin_tlsrec_receive_limit_offer(limit);
+        }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn resolve_tls13_receive_limit_offer(
+        &mut self,
+        negotiated: bool,
+    ) -> Result<Option<verus_tls13_record::Limit>, Error> {
+        self.record_layer
+            .resolve_tlsrec_receive_limit_offer(negotiated)
+            .map_err(|error| match error {
+                verus_tls13_record::Error::RecordOverflow => Error::PeerSentOversizedRecord,
+                _ => Error::General("invalid TLS 1.3 record_size_limit negotiation state".into()),
+            })
     }
 
     /// Returns true if the caller should call [`Connection::write_tls`] as soon as possible.
@@ -102,6 +282,87 @@ impl CommonState {
     /// [`Connection::write_tls`]: crate::Connection::write_tls
     pub fn wants_write(&self) -> bool {
         !self.sendable_tls.is_empty()
+            || cfg!(all(feature = "aws_lc_rs", not(feature = "tls12")))
+                && self.tlsrec_has_buffered_application_records()
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn tlsrec_has_buffered_application_records(&self) -> bool {
+        !self.sendable_application_plaintext.is_empty()
+            || !self.in_flight_application_tls.is_empty()
+    }
+
+    #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+    fn tlsrec_has_buffered_application_records(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn write_tls_records(
+        &mut self,
+        wr: &mut dyn std::io::Write,
+    ) -> Result<usize, std::io::Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        {
+            let next = verus_tls13_record::select_next_outbound_record(
+                !self.in_flight_application_tls.is_empty(),
+                !self.sendable_tls.is_empty(),
+                !self.sendable_application_plaintext.is_empty(),
+            );
+            match next {
+                verus_tls13_record::NextOutboundRecord::FinishCommittedApplication => {
+                    return self.in_flight_application_tls.write_front_to(wr);
+                }
+                verus_tls13_record::NextOutboundRecord::Control => {
+                    return self.sendable_tls.write_to(wr);
+                }
+                verus_tls13_record::NextOutboundRecord::SealPendingApplication => {
+                    let payload = self
+                        .sendable_application_plaintext
+                        .pop()
+                        .expect("verified scheduler selected available application plaintext");
+                    let plain = OutboundPlainMessage {
+                        typ: ContentType::ApplicationData,
+                        version: ProtocolVersion::TLSv1_2,
+                        payload: payload.as_slice().into(),
+                    };
+                    debug_assert_eq!(
+                        self.record_layer.next_pre_encrypt_action(),
+                        PreEncryptAction::Nothing,
+                        "traffic-key refresh must precede late application sealing"
+                    );
+                    let encoded = self
+                        .record_layer
+                        .encrypt_tlsrec_wire(plain)
+                        .map_err(|error| {
+                            let _ = error;
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "TLS 1.3 record encryption failed",
+                            )
+                        })?;
+                    self.in_flight_application_tls.append(encoded);
+                    return self.in_flight_application_tls.write_front_to(wr);
+                }
+                verus_tls13_record::NextOutboundRecord::Idle => return Ok(0),
+            }
+        }
+        #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+        self.sendable_tls.write_to(wr)
+    }
+
+    pub(crate) fn set_outgoing_tls_buffer_limit(&mut self, limit: Option<usize>) {
+        self.sendable_tls.set_limit(limit);
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        {
+            self.sendable_application_plaintext.set_limit(limit);
+            self.in_flight_application_tls.set_limit(limit);
+            self.tlsrec_outgoing_buffer_limit = limit;
+        }
+    }
+
+    pub(crate) fn has_pending_tls_records(&self) -> bool {
+        !self.sendable_tls.is_empty() || self.tlsrec_has_buffered_application_records()
     }
 
     /// Returns true if the connection is currently performing the TLS handshake.
@@ -238,6 +499,10 @@ impl CommonState {
         payload: OutboundChunks<'_>,
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() && !self.tlsrec_control.may_write_application_data() {
+            return Ok(0);
+        }
         if payload.is_empty() {
             return Ok(0);
         }
@@ -287,7 +552,7 @@ impl CommonState {
                 payload,
             );
 
-        Ok(self.write_fragments(outgoing_tls, fragments))
+        self.write_fragments(outgoing_tls, fragments)
     }
 
     // Changing the keys must not span any fragmented handshake
@@ -295,7 +560,16 @@ impl CommonState {
     // been protected with two different record layer protections,
     // which is illegal.  Not mentioned in RFC.
     pub(crate) fn check_aligned_handshake(&mut self) -> Result<(), Error> {
-        if !self.aligned_handshake {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        let aligned = if self.is_quic() {
+            self.aligned_handshake
+        } else {
+            self.tlsrec_peer_handshake.is_aligned()
+        };
+        #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+        let aligned = self.aligned_handshake;
+
+        if !aligned {
             Err(self.send_fatal_alert(
                 AlertDescription::UnexpectedMessage,
                 PeerMisbehaved::KeyEpochWithPendingFragment,
@@ -324,9 +598,21 @@ impl CommonState {
         // constant and predictable amount, so it's not a terrible issue.
         let len = match limit {
             #[cfg(feature = "std")]
-            Limit::Yes => self
-                .sendable_tls
-                .apply_limit(payload.len()),
+            Limit::Yes => {
+                #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                {
+                    let queued = self.sendable_tls.len()
+                        + self.in_flight_application_tls.len()
+                        + self.sendable_application_plaintext.len();
+                    self.tlsrec_outgoing_buffer_limit
+                        .map(|limit| limit.saturating_sub(queued).min(payload.len()))
+                        .unwrap_or(payload.len())
+                }
+                #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+                {
+                    self.sendable_tls.apply_limit(payload.len())
+                }
+            }
             Limit::No => payload.len(),
         };
 
@@ -337,6 +623,23 @@ impl CommonState {
                 ProtocolVersion::TLSv1_2,
                 payload.split_at(len).0,
             );
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            let already_pending = self.sendable_application_plaintext.chunk_count();
+            for additional in 0..iter.len() {
+                let projected = u64::try_from(already_pending.saturating_add(additional))
+                    .unwrap_or(u64::MAX);
+                if self.record_layer.pre_encrypt_action(projected)
+                    != PreEncryptAction::Nothing
+                {
+                    // Application records are still plaintext at this point.
+                    // The owning ConnectionCommon consumes this request and
+                    // emits KeyUpdate before write_tls seals any of them.
+                    self.refresh_traffic_keys_pending = true;
+                    break;
+                }
+            }
+        }
         for m in iter {
             self.send_single_fragment(m);
         }
@@ -345,10 +648,66 @@ impl CommonState {
     }
 
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            if m.typ == ContentType::Alert {
+                match self.record_layer.encrypt_tlsrec_alert_wire(m) {
+                    Ok(wire) => {
+                        self.sendable_tls.append(wire);
+                    }
+                    Err(_error) => error!("unable to encrypt terminal TLS alert: {_error}"),
+                }
+                return;
+            }
+            if m.typ == ContentType::ApplicationData {
+                let projected = u64::try_from(
+                    self.sendable_application_plaintext.chunk_count(),
+                )
+                .unwrap_or(u64::MAX);
+                if self.record_layer.pre_encrypt_action(projected) != PreEncryptAction::Nothing {
+                    self.refresh_traffic_keys_pending = true;
+                }
+                self.sendable_application_plaintext.append(m.payload.to_vec());
+                return;
+            }
+
+            match self.record_layer.next_pre_encrypt_action() {
+                PreEncryptAction::Nothing => {}
+                PreEncryptAction::RefreshOrClose => {
+                    self.refresh_traffic_keys_pending = true;
+                    return;
+                }
+                PreEncryptAction::Refuse => return,
+            }
+            self.observe_tlsrec_local_handshake(&m);
+            match self.record_layer.encrypt_tlsrec_wire(m) {
+                Ok(wire) => {
+                    self.sendable_tls.append(wire);
+                }
+                Err(_error) => error!("unable to encrypt TLS 1.3 record: {_error}"),
+            }
+            return;
+        }
+
         if m.typ == ContentType::Alert {
             // Alerts are always sendable -- never quashed by a PreEncryptAction.
-            let em = self.record_layer.encrypt_outgoing(m);
-            self.queue_tls_message(em);
+            match self.record_layer.encrypt_outgoing_alert(m) {
+                Ok(em) => self.queue_tls_message(em),
+                Err(_error) => error!("unable to encrypt terminal TLS alert: {_error}"),
+            }
+            return;
+        }
+
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() && m.typ == ContentType::ApplicationData {
+            let projected = u64::try_from(
+                self.sendable_application_plaintext.chunk_count(),
+            )
+            .unwrap_or(u64::MAX);
+            if self.record_layer.pre_encrypt_action(projected) != PreEncryptAction::Nothing {
+                self.refresh_traffic_keys_pending = true;
+            }
+            self.sendable_application_plaintext.append(m.payload.to_vec());
             return;
         }
 
@@ -383,11 +742,18 @@ impl CommonState {
             }
         };
 
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        self.observe_tlsrec_local_handshake(&m);
+
         let em = self.record_layer.encrypt_outgoing(m);
         self.queue_tls_message(em);
     }
 
     fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() && !self.tlsrec_control.may_write_application_data() {
+            return 0;
+        }
         debug_assert!(self.may_send_application_data);
         debug_assert!(self.record_layer.is_encrypting());
 
@@ -473,6 +839,9 @@ impl CommonState {
                 .message_fragmenter
                 .fragment_message(msg);
             for m in iter {
+                #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                self.queue_tlsrec_plaintext(&m);
+                #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
                 self.queue_tls_message(m.to_unencrypted_opaque());
             }
         } else {
@@ -481,6 +850,13 @@ impl CommonState {
     }
 
     pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic()
+            && self.tlsrec_control.receive_disposition()
+                != Ok(verus_tls13_record::ReceiveDisposition::Process)
+        {
+            return;
+        }
         self.temper_counters.received_app_data();
         self.received_plaintext
             .append(bytes.into_vec());
@@ -511,6 +887,24 @@ impl CommonState {
     }
 
     pub(crate) fn process_alert(&mut self, alert: &AlertMessagePayload) -> Result<(), Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            let event = self.tlsrec_control
+                .receive_alert(&[u8::from(alert.level), u8::from(alert.description)])
+                .map_err(|_| Error::General("invalid TLS 1.3 alert transition".into()))?;
+            match event {
+                verus_tls13_record::AlertEvent::CloseNotify
+                    if self.may_receive_application_data =>
+                {
+                    self.has_received_close_notify = true;
+                    return Ok(());
+                }
+                verus_tls13_record::AlertEvent::FatalOrUnknown(_) => {
+                    return Err(Error::AlertReceived(alert.description));
+                }
+                _ => {}
+            }
+        }
         // Reject unknown AlertLevels.
         if let AlertLevel::Unknown(_) = alert.level {
             return Err(self.send_fatal_alert(
@@ -521,7 +915,10 @@ impl CommonState {
 
         // If we get a CloseNotify, make a note to declare EOF to our
         // caller.  But do not treat unauthenticated alerts like this.
-        if self.may_receive_application_data && alert.description == AlertDescription::CloseNotify {
+        if self.may_receive_application_data
+            && alert.level == AlertLevel::Warning
+            && alert.description == AlertDescription::CloseNotify
+        {
             self.has_received_close_notify = true;
             return Ok(());
         }
@@ -548,6 +945,79 @@ impl CommonState {
         Err(err)
     }
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn process_tlsrec_alert_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        let event = match self.tlsrec_control.receive_alert(payload) {
+            Ok(event) => event,
+            Err(error) => {
+                let alert = verus_tls13_record::record_error_alert(error)
+                    .unwrap_or(verus_tls13_record::RecordAlert::DecodeError);
+                let description = match alert {
+                    verus_tls13_record::RecordAlert::UnexpectedMessage => {
+                        AlertDescription::UnexpectedMessage
+                    }
+                    verus_tls13_record::RecordAlert::BadRecordMac => {
+                        AlertDescription::BadRecordMac
+                    }
+                    verus_tls13_record::RecordAlert::RecordOverflow => {
+                        AlertDescription::RecordOverflow
+                    }
+                    verus_tls13_record::RecordAlert::DecodeError => AlertDescription::DecodeError,
+                    verus_tls13_record::RecordAlert::IllegalParameter => {
+                        AlertDescription::IllegalParameter
+                    }
+                    verus_tls13_record::RecordAlert::InternalError => {
+                        AlertDescription::InternalError
+                    }
+                };
+                return Err(self.send_fatal_alert(
+                    description,
+                    InvalidMessage::UnexpectedMessage("invalid TLS 1.3 Alert record"),
+                ));
+            }
+        };
+
+        match event {
+            verus_tls13_record::AlertEvent::CloseNotify => {
+                if !self.may_receive_application_data {
+                    return Err(self.send_fatal_alert(
+                        AlertDescription::UnexpectedMessage,
+                        Error::AlertReceived(AlertDescription::CloseNotify),
+                    ));
+                }
+                self.has_received_close_notify = true;
+                Ok(())
+            }
+            verus_tls13_record::AlertEvent::UserCanceled => {
+                self.temper_counters.received_warning_alert()?;
+                Ok(())
+            }
+            verus_tls13_record::AlertEvent::FatalOrUnknown(description) => {
+                Err(Error::AlertReceived(AlertDescription::from(description)))
+            }
+        }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn process_tlsrec_ccs_payload(
+        &mut self,
+        protected: bool,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        if self
+            .tlsrec_control
+            .validate_ccs(protected, payload)
+            .is_err()
+        {
+            return Err(self.send_fatal_alert(
+                AlertDescription::UnexpectedMessage,
+                PeerMisbehaved::IllegalMiddleboxChangeCipherSpec,
+            ));
+        }
+        self.temper_counters
+            .received_tls13_change_cipher_spec()
+    }
+
     pub(crate) fn send_cert_verify_error_alert(&mut self, err: Error) -> Error {
         self.send_fatal_alert(
             match &err {
@@ -564,11 +1034,19 @@ impl CommonState {
         desc: AlertDescription,
         err: impl Into<Error>,
     ) -> Error {
-        debug_assert!(!self.sent_fatal_alert);
+        let err = err.into();
+        if self.sent_fatal_alert {
+            return err;
+        }
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            self.tlsrec_control
+                .fail(verus_tls13_record::Error::UnexpectedMessage);
+        }
         let m = Message::build_alert(AlertLevel::Fatal, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
         self.sent_fatal_alert = true;
-        err.into()
+        err
     }
 
     /// Queues a `close_notify` warning alert to be sent in the next
@@ -580,6 +1058,21 @@ impl CommonState {
     /// [`Connection::write_tls`]: crate::Connection::write_tls
     pub fn send_close_notify(&mut self) {
         if self.sent_fatal_alert {
+            return;
+        }
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            let plan = match self.tlsrec_control.plan_local_cancel() {
+                Ok(plan) => plan,
+                Err(_) => return,
+            };
+            debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+            self.sent_fatal_alert = true;
+            self.has_sent_close_notify = true;
+            if plan.first[1] == u8::from(AlertDescription::UserCanceled) {
+                self.send_warning_alert_no_log(AlertDescription::UserCanceled);
+            }
+            self.send_warning_alert_no_log(AlertDescription::CloseNotify);
             return;
         }
         debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
@@ -594,7 +1087,7 @@ impl CommonState {
     ) -> Result<usize, EncryptError> {
         self.send_close_notify();
         self.check_required_size(outgoing_tls, [].into_iter())?;
-        Ok(self.write_fragments(outgoing_tls, [].into_iter()))
+        self.write_fragments(outgoing_tls, [].into_iter())
     }
 
     fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {
@@ -608,6 +1101,11 @@ impl CommonState {
         fragments: impl Iterator<Item = OutboundPlainMessage<'a>>,
     ) -> Result<(), EncryptError> {
         let mut required_size = self.sendable_tls.len();
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        {
+            required_size += self.in_flight_application_tls.len();
+            required_size += self.tlsrec_pending_application_wire_len();
+        }
 
         for m in fragments {
             required_size += m.encoded_len(&self.record_layer);
@@ -626,7 +1124,7 @@ impl CommonState {
         &mut self,
         outgoing_tls: &mut [u8],
         fragments: impl Iterator<Item = OutboundPlainMessage<'a>>,
-    ) -> usize {
+    ) -> Result<usize, EncryptError> {
         let mut written = 0;
 
         // Any pre-existing encrypted messages in `sendable_tls` must
@@ -637,18 +1135,31 @@ impl CommonState {
             written += len;
         }
 
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        while let Some(message) = self.in_flight_application_tls.pop() {
+            let len = message.len();
+            outgoing_tls[written..written + len].copy_from_slice(&message);
+            written += len;
+        }
+
         for m in fragments {
-            let em = self
-                .record_layer
-                .encrypt_outgoing(m)
-                .encode();
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            let em = if !self.is_quic() {
+                self.record_layer
+                    .encrypt_tlsrec_wire(m)
+                    .map_err(|_| EncryptError::EncryptExhausted)?
+            } else {
+                self.record_layer.encrypt_outgoing(m).encode()
+            };
+            #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+            let em = self.record_layer.encrypt_outgoing(m).encode();
 
             let len = em.len();
             outgoing_tls[written..written + len].copy_from_slice(&em);
             written += len;
         }
 
-        written
+        Ok(written)
     }
 
     pub(crate) fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
@@ -680,12 +1191,12 @@ impl CommonState {
         // completed, but also don't want to read if we still have sendable tls.
         self.received_plaintext.is_empty()
             && !self.has_received_close_notify
-            && (self.may_send_application_data || self.sendable_tls.is_empty())
+            && (self.may_send_application_data || !self.has_pending_tls_records())
     }
 
     pub(crate) fn current_io_state(&self) -> IoState {
         IoState {
-            tls_bytes_to_write: self.sendable_tls.len(),
+            tls_bytes_to_write: self.sendable_tls.len() + self.tlsrec_buffered_application_wire_len(),
             plaintext_bytes_to_read: self.received_plaintext.len(),
             peer_has_closed: self.has_received_close_notify,
         }
@@ -695,12 +1206,50 @@ impl CommonState {
         self.protocol == Protocol::Quic
     }
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn tlsrec_pending_application_wire_len(&self) -> usize {
+        let overhead = 5usize.saturating_add(self.record_layer.encrypted_len(0));
+        self.sendable_application_plaintext
+            .len()
+            .saturating_add(
+                self.sendable_application_plaintext
+                    .chunk_count()
+                    .saturating_mul(overhead),
+            )
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn tlsrec_buffered_application_wire_len(&self) -> usize {
+        self.in_flight_application_tls
+            .len()
+            .saturating_add(self.tlsrec_pending_application_wire_len())
+    }
+
+    #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+    fn tlsrec_buffered_application_wire_len(&self) -> usize {
+        0
+    }
+
     pub(crate) fn should_update_key(
         &mut self,
         key_update_request: &KeyUpdateRequest,
     ) -> Result<bool, Error> {
         self.temper_counters
             .received_key_update_request()?;
+
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() {
+            return match key_update_request {
+                KeyUpdateRequest::UpdateNotRequested => Ok(false),
+                KeyUpdateRequest::UpdateRequested => {
+                    Ok(self.tlsrec_control.pending_key_update_response())
+                }
+                _ => Err(self.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    InvalidMessage::InvalidKeyUpdate,
+                )),
+            };
+        }
 
         match key_update_request {
             KeyUpdateRequest::UpdateNotRequested => Ok(false),
@@ -721,9 +1270,58 @@ impl CommonState {
         );
     }
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn send_tlsrec_key_update(
+        &mut self,
+        request: verus_tls13_record::KeyUpdateRequest,
+    ) -> Result<(), Error> {
+        self.tlsrec_control
+            .permit_outbound_key_update()
+            .map_err(|_| Error::General("TLS 1.3 KeyUpdate is not permitted".into()))?;
+        let message = self.record_layer.seal_tlsrec_key_update(request)?;
+        self.refresh_traffic_keys_pending = false;
+        self.tlsrec_control
+            .observe_local_milestone(verus_tls13_record::HandshakeMilestone::KeyUpdate(request))
+            .map_err(|_| Error::General("TLS 1.3 KeyUpdate state overflow".into()))?;
+        self.sendable_tls.append(message);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn advance_tlsrec_read_epoch(
+        &mut self,
+        request: verus_tls13_record::KeyUpdateRequest,
+    ) -> Result<(), Error> {
+        self.record_layer
+            .advance_tlsrec_read_epoch(&mut self.tlsrec_peer_handshake, request)
+    }
+
     pub(crate) fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic()
+            && self.tlsrec_control.validate_ccs(false, &[1]).is_err()
+        {
+            return Err(self.send_fatal_alert(
+                AlertDescription::UnexpectedMessage,
+                PeerMisbehaved::IllegalMiddleboxChangeCipherSpec,
+            ));
+        }
         self.temper_counters
             .received_tls13_change_cipher_spec()
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn tlsrec_discard_after_close(&self) -> bool {
+        !self.is_quic()
+            && self.tlsrec_control.receive_disposition()
+                == Ok(verus_tls13_record::ReceiveDisposition::DiscardAfterClose)
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn tlsrec_receive_disposition(
+        &self,
+    ) -> Result<verus_tls13_record::ReceiveDisposition, verus_tls13_record::Error> {
+        self.tlsrec_control.receive_disposition()
     }
 }
 
@@ -766,6 +1364,10 @@ impl CommonState {
         limit: Limit,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.is_quic() && !self.tlsrec_control.may_write_application_data() {
+            return 0;
+        }
         if !self.may_send_application_data {
             // If we haven't completed handshaking, buffer
             // plaintext to send once we do.

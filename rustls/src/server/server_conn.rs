@@ -316,6 +316,10 @@ pub struct ServerConfig {
     /// [ServerConnection::new]: crate::server::ServerConnection::new
     pub max_fragment_size: Option<usize>,
 
+    /// The RFC 8449 TLS 1.3 protected-record size this server advertises as
+    /// its receive capability. `None` (the default) omits the extension.
+    pub record_size_limit: Option<crate::RecordSizeLimit>,
+
     /// How to store client sessions.
     ///
     /// See [ServerConfig#sharing-resumption-storage-between-serverconfigs]
@@ -1061,6 +1065,13 @@ impl Accepted {
         mut self,
         config: Arc<ServerConfig>,
     ) -> Result<ServerConnection, (Error, AcceptedAlert)> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if config.max_early_data_size > 0 {
+            return Err((
+                Error::General("early data is outside the verified TLS 1.3 record profile".into()),
+                AcceptedAlert::empty(),
+            ));
+        }
         if let Err(err) = self
             .connection
             .set_max_fragment_size(config.max_fragment_size)
@@ -1223,6 +1234,12 @@ impl ConnectionCore<ServerConnectionData> {
         config: Arc<ServerConfig>,
         extra_exts: ServerExtensionsInput<'static>,
     ) -> Result<Self, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if config.max_early_data_size > 0 {
+            return Err(Error::General(
+                "early data is outside the verified TLS 1.3 record profile".into(),
+            ));
+        }
         let mut common = CommonState::new(Side::Server);
         common.set_max_fragment_size(config.max_fragment_size)?;
         common.enable_secret_extraction = config.enable_secret_extraction;

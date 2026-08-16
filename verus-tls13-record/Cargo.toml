@@ -1,0 +1,19 @@
+[package]
+name = "verus-tls13-record"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.71"
+license = "Apache-2.0 OR ISC OR MIT"
+description = "Verified TLS 1.3 record and key-epoch state machine for rustls"
+repository = "https://github.com/SichangHe/rustls-tlsrec"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+zeroize = { workspace = true, features = ["alloc"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_keep_ghost)"] }

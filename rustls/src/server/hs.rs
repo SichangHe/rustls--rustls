@@ -705,6 +705,21 @@ pub(super) fn process_client_hello<'m>(
         ));
     }
 
+    if matches!(client_hello.record_size_limit, Some(value) if !(64..=16_385).contains(&value)) {
+        return Err(cx.common.send_fatal_alert(
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::InvalidRecordSizeLimit,
+        ));
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    if client_hello.early_data_request.is_some() && !cx.common.is_quic() {
+        return Err(cx.common.send_fatal_alert(
+            AlertDescription::UnsupportedExtension,
+            PeerMisbehaved::EarlyDataOfferedInSelectedProfile,
+        ));
+    }
+
     // No handshake messages should follow this one in this flight.
     cx.common.check_aligned_handshake()?;
 

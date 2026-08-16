@@ -60,6 +60,11 @@ impl KeyScheduleEarly {
             client_random,
         );
 
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            return;
+        }
+
         match common.side {
             Side::Client => self
                 .ks
@@ -289,6 +294,11 @@ impl KeyScheduleHandshake {
     ) {
         debug_assert_eq!(common.side, Side::Server);
         let secret = &self.client_handshake_traffic_secret;
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            self.ks.set_decrypter(secret, common);
+            return;
+        }
         match skip_requested {
             None => self.ks.set_decrypter(secret, common),
             Some(max_early_data_size) => common
@@ -319,7 +329,7 @@ impl KeyScheduleHandshake {
 
         before_finished
             .ks
-            .set_encrypter(server_secret, common);
+            .set_application_encrypter(server_secret, common);
 
         if common.is_quic() {
             common.quic.traffic_secrets = Some(quic::Secrets::new(
@@ -451,9 +461,9 @@ impl KeyScheduleClientBeforeFinished {
         );
 
         next.ks
-            .set_decrypter(server_secret, common);
+            .set_application_decrypter(server_secret, common);
         next.ks
-            .set_encrypter(client_secret, common);
+            .set_application_encrypter(client_secret, common);
 
         if common.is_quic() {
             common.quic.traffic_secrets = Some(quic::Secrets::new(
@@ -486,26 +496,27 @@ impl KeyScheduleTrafficWithClientFinishedPending {
             .set_decrypter(&self.handshake_client_traffic_secret, common);
     }
 
-    pub(crate) fn sign_client_finish(
-        self,
-        hs_hash: &hash::Output,
-        common: &mut CommonState,
-    ) -> (KeyScheduleBeforeFinished, hmac::Tag) {
-        debug_assert_eq!(common.side, Side::Server);
-        let tag = self
+    pub(crate) fn expected_client_finish(&self, hs_hash: &hash::Output) -> hmac::Tag {
+        self
             .before_finished
             .ks
-            .sign_finish(&self.handshake_client_traffic_secret, hs_hash);
+            .sign_finish(&self.handshake_client_traffic_secret, hs_hash)
+    }
 
-        // Install keying to read future messages.
-        self.before_finished.ks.set_decrypter(
+    pub(crate) fn confirm_client_finish(
+        self,
+        common: &mut CommonState,
+    ) -> KeyScheduleBeforeFinished {
+        debug_assert_eq!(common.side, Side::Server);
+        // Authentication succeeded: consume the exact Finished boundary and
+        // only now install keying to read future messages.
+        self.before_finished.ks.set_application_decrypter(
             &self
                 .before_finished
                 .current_client_traffic_secret,
             common,
         );
-
-        (self.before_finished, tag)
+        self.before_finished
     }
 }
 
@@ -519,10 +530,23 @@ pub(crate) struct KeyScheduleTraffic {
 }
 
 impl KeyScheduleTraffic {
-    pub(crate) fn update_encrypter_and_notify(&mut self, common: &mut CommonState) {
+    pub(crate) fn update_encrypter_and_notify(
+        &mut self,
+        common: &mut CommonState,
+    ) -> Result<(), Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            common.send_tlsrec_key_update(
+                verus_tls13_record::KeyUpdateRequest::UpdateNotRequested,
+            )?;
+            self.replace_secret_from_record_layer(common.side, common, true)?;
+            return Ok(());
+        }
+
         let secret = self.next_application_traffic_secret(common.side);
         common.enqueue_key_update_notification();
         self.ks.set_encrypter(&secret, common);
+        Ok(())
     }
 
     pub(crate) fn request_key_update_and_update_encrypter(
@@ -530,15 +554,67 @@ impl KeyScheduleTraffic {
         common: &mut CommonState,
     ) -> Result<(), Error> {
         common.check_aligned_handshake()?;
+
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            common.send_tlsrec_key_update(verus_tls13_record::KeyUpdateRequest::UpdateRequested)?;
+            self.replace_secret_from_record_layer(common.side, common, true)?;
+            return Ok(());
+        }
+
         common.send_msg_encrypt(Message::build_key_update_request().into());
         let secret = self.next_application_traffic_secret(common.side);
         self.ks.set_encrypter(&secret, common);
         Ok(())
     }
 
-    pub(crate) fn update_decrypter(&mut self, common: &mut CommonState) {
+    pub(crate) fn update_decrypter(
+        &mut self,
+        common: &mut CommonState,
+        request: &crate::msgs::enums::KeyUpdateRequest,
+    ) -> Result<(), Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            let request = match request {
+                crate::msgs::enums::KeyUpdateRequest::UpdateNotRequested => {
+                    verus_tls13_record::KeyUpdateRequest::UpdateNotRequested
+                }
+                crate::msgs::enums::KeyUpdateRequest::UpdateRequested => {
+                    verus_tls13_record::KeyUpdateRequest::UpdateRequested
+                }
+                _ => {
+                    return Err(Error::General("invalid TLS 1.3 KeyUpdate request".into()));
+                }
+            };
+            common.advance_tlsrec_read_epoch(request)?;
+            self.replace_secret_from_record_layer(common.side.peer(), common, false)?;
+            return Ok(());
+        }
+
         let secret = self.next_application_traffic_secret(common.side.peer());
         self.ks.set_decrypter(&secret, common);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn replace_secret_from_record_layer(
+        &mut self,
+        side: Side,
+        common: &CommonState,
+        write: bool,
+    ) -> Result<(), Error> {
+        let source = if write {
+            common.record_layer.tlsrec_write_secret()
+        } else {
+            common.record_layer.tlsrec_read_secret()
+        }
+        .ok_or_else(|| Error::General("TLS 1.3 traffic secret is unavailable".into()))?;
+        let current = match side {
+            Side::Client => &mut self.current_client_traffic_secret,
+            Side::Server => &mut self.current_server_traffic_secret,
+        };
+        *current = OkmBlock::new(source);
+        Ok(())
     }
 
     pub(crate) fn next_application_traffic_secret(&mut self, side: Side) -> OkmBlock {
@@ -747,15 +823,109 @@ struct KeyScheduleSuite {
     suite: &'static Tls13CipherSuite,
 }
 
+#[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+struct TlsrecTrafficKeyProvider {
+    suite: &'static Tls13CipherSuite,
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+impl verus_tls13_record::TrafficKeyProvider for TlsrecTrafficKeyProvider {
+    fn hash_len(&self) -> usize {
+        self.suite.common.hash_provider.output_len()
+    }
+
+    fn key_len(&self) -> usize {
+        self.suite.aead_alg.key_len()
+    }
+
+    fn expand(
+        &self,
+        secret: &[u8],
+        label: verus_tls13_record::HkdfLabel<'_>,
+        output: &mut [u8],
+    ) -> Result<(), verus_tls13_record::ProviderError> {
+        let secret = OkmBlock::new(secret);
+        let expander = self
+            .suite
+            .hkdf_provider
+            .expander_for_okm(&secret);
+        expander
+            .expand_slice(&label.parts(), output)
+            .map_err(|_| verus_tls13_record::ProviderError)
+    }
+
+    fn aead(
+        &self,
+        key: &[u8],
+    ) -> Result<Box<dyn verus_tls13_record::Aead>, verus_tls13_record::ProviderError> {
+        crate::crypto::aws_lc_rs::tls13::tlsrec_aead_from_bytes(
+            self.suite,
+            key,
+        )
+        .map_err(|_| verus_tls13_record::ProviderError)
+    }
+}
+
 impl KeyScheduleSuite {
+    fn set_application_encrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            common
+                .activate_tlsrec_local_after(verus_tls13_record::HandshakeMilestone::Finished)
+                .expect("application write keys require a complete local Finished record");
+            common.record_layer.set_tlsrec_application_encrypter(
+                Box::new(TlsrecTrafficKeyProvider { suite: self.suite }),
+                secret.as_ref(),
+                self.suite.common.confidentiality_limit,
+                common.tls13_send_inner_limit,
+            );
+            return;
+        }
+        self.set_encrypter(secret, common);
+    }
+
+    fn set_application_decrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            common
+                .activate_tlsrec_peer_after(verus_tls13_record::HandshakeMilestone::Finished)
+                .expect("application read keys require a complete peer Finished record");
+            common.record_layer.set_tlsrec_application_decrypter(
+                Box::new(TlsrecTrafficKeyProvider { suite: self.suite }),
+                secret.as_ref(),
+                self.suite.common.confidentiality_limit,
+                common.tls13_receive_inner_limit,
+            );
+            return;
+        }
+        self.set_decrypter(secret, common);
+    }
+
     fn set_encrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            let milestone = match common.side {
+                Side::Client => verus_tls13_record::HandshakeMilestone::ClientHello,
+                Side::Server => verus_tls13_record::HandshakeMilestone::ServerHello,
+            };
+            common
+                .activate_tlsrec_local_after(milestone)
+                .expect("handshake write keys require the matching local record boundary");
+            common.record_layer.set_tlsrec_encrypter(
+                Box::new(TlsrecTrafficKeyProvider { suite: self.suite }),
+                secret.as_ref(),
+                self.suite.common.confidentiality_limit,
+                common.tls13_send_inner_limit,
+            );
+            return;
+        }
+
         let expander = self
             .suite
             .hkdf_provider
             .expander_for_okm(secret);
         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
         let iv = derive_traffic_iv(expander.as_ref());
-
         common
             .record_layer
             .set_message_encrypter(
@@ -765,6 +935,24 @@ impl KeyScheduleSuite {
     }
 
     fn set_decrypter(&self, secret: &OkmBlock, common: &mut CommonState) {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !common.is_quic() {
+            let milestone = match common.side {
+                Side::Client => verus_tls13_record::HandshakeMilestone::ServerHello,
+                Side::Server => verus_tls13_record::HandshakeMilestone::ClientHello,
+            };
+            common
+                .activate_tlsrec_peer_after(milestone)
+                .expect("handshake read keys require the matching peer record boundary");
+            common.record_layer.set_tlsrec_decrypter(
+                Box::new(TlsrecTrafficKeyProvider { suite: self.suite }),
+                secret.as_ref(),
+                self.suite.common.confidentiality_limit,
+                common.tls13_receive_inner_limit,
+            );
+            return;
+        }
+
         common
             .record_layer
             .set_message_decrypter(self.derive_decrypter(secret));
@@ -810,7 +998,10 @@ impl KeyScheduleSuite {
             .suite
             .hkdf_provider
             .expander_for_okm(base_key);
-        hkdf_expand_label_block(expander.as_ref(), b"traffic upd", &[])
+        let label = verus_tls13_record::traffic_update_label(expander.hash_len())
+            .expect("TLS 1.3 hash length satisfies HkdfLabel bounds");
+        let info = label.parts();
+        expander.expand_block(&info)
     }
 
     /// Derive the PSK to use given a resumption_master_secret and
@@ -872,14 +1063,21 @@ pub fn derive_traffic_key(
     expander: &dyn HkdfExpander,
     aead_alg: &dyn Tls13AeadAlgorithm,
 ) -> AeadKey {
-    hkdf_expand_label_aead_key(expander, aead_alg.key_len(), b"key", &[])
+    let label = verus_tls13_record::key_label(aead_alg.key_len())
+        .expect("TLS 1.3 provider key length satisfies HkdfLabel bounds");
+    let info = label.parts();
+    let key: AeadKey = expand(expander, &info);
+    key.with_length(aead_alg.key_len())
 }
 
 /// [HKDF-Expand-Label] where the output is an IV.
 ///
 /// [HKDF-Expand-Label]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.1>
 pub fn derive_traffic_iv(expander: &dyn HkdfExpander) -> Iv {
-    hkdf_expand_label(expander, b"iv", &[])
+    let label = verus_tls13_record::iv_label()
+        .expect("the fixed TLS 1.3 IV HkdfLabel is encodable");
+    let info = label.parts();
+    expand(expander, &info)
 }
 
 /// [HKDF-Expand-Label] where the output length is a compile-time constant, and therefore

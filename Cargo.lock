@@ -2716,6 +2716,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "time",
+ "verus-tls13-record",
  "webpki-roots",
  "x509-parser 0.17.0",
  "zeroize",
@@ -3257,6 +3258,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tlsrec-integration"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3405,6 +3413,13 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "verus-tls13-record"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "walkdir"

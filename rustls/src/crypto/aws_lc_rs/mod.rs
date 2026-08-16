@@ -44,9 +44,55 @@ pub fn default_provider() -> CryptoProvider {
         cipher_suites: DEFAULT_CIPHER_SUITES.to_vec(),
         kx_groups: default_kx_groups(),
         signature_verification_algorithms: SUPPORTED_SIG_ALGS,
-        secure_random: &AwsLcRs,
-        key_provider: &AwsLcRs,
+        secure_random: &AWS_LC_RS,
+        key_provider: &AWS_LC_RS,
     }
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+pub(crate) fn tlsrec_provider_eligibility(
+    provider: &CryptoProvider,
+) -> Result<(), &'static str> {
+    let expected_random: &dyn SecureRandom = &AWS_LC_RS;
+    let expected_key_provider: &dyn KeyProvider = &AWS_LC_RS;
+    if !core::ptr::eq(provider.secure_random, expected_random)
+        || !core::ptr::eq(provider.key_provider, expected_key_provider)
+    {
+        return Err("random/key provider identity differs from aws_lc_rs");
+    }
+    if provider.cipher_suites.is_empty() {
+        return Err("cipher suite set is empty");
+    }
+    for suite in provider.cipher_suites.iter() {
+        let Some(suite) = suite.tls13() else {
+            return Err("cipher suite set includes a non-TLS-1.3 suite");
+        };
+        if !tls13::tlsrec_suite_supported(suite) {
+            return Err("cipher suite object is not one of the exact aws_lc_rs suite objects");
+        }
+    }
+
+    let expected_groups = default_kx_groups();
+    if provider.kx_groups.len() != expected_groups.len()
+        || !provider
+            .kx_groups
+            .iter()
+            .zip(expected_groups.iter())
+            .all(|(actual, expected)| core::ptr::eq(*actual, *expected))
+    {
+        return Err("key-exchange groups differ from aws_lc_rs");
+    }
+
+    if !core::ptr::eq(
+        provider.signature_verification_algorithms.all,
+        SUPPORTED_SIG_ALGS.all,
+    ) || !core::ptr::eq(
+        provider.signature_verification_algorithms.mapping,
+        SUPPORTED_SIG_ALGS.mapping,
+    ) {
+        return Err("signature algorithms differ from aws_lc_rs");
+    }
+    Ok(())
 }
 
 fn default_kx_groups() -> Vec<&'static dyn SupportedKxGroup> {
@@ -65,7 +111,11 @@ fn default_kx_groups() -> Vec<&'static dyn SupportedKxGroup> {
 }
 
 #[derive(Debug)]
-struct AwsLcRs;
+struct AwsLcRs {
+    _identity: u8,
+}
+
+static AWS_LC_RS: AwsLcRs = AwsLcRs { _identity: 0xa5 };
 
 impl SecureRandom for AwsLcRs {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {

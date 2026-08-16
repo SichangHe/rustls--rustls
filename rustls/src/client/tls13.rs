@@ -500,6 +500,61 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         self.transcript.add_message(&m);
 
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        let negotiated_receive_limit = if !cx.common.is_quic() {
+            match cx
+                .common
+                .resolve_tls13_receive_limit_offer(exts.record_size_limit.is_some())
+            {
+                Ok(limit) => limit,
+                Err(error) => {
+                    let description = match error {
+                        Error::PeerSentOversizedRecord => AlertDescription::RecordOverflow,
+                        _ => AlertDescription::IllegalParameter,
+                    };
+                    return Err(cx.common.send_fatal_alert(description, error));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(peer_limit) = exts.record_size_limit {
+            let send_inner_limit = verus_tls13_record::Limit::new(usize::from(peer_limit))
+                .map_err(|_| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::InvalidRecordSizeLimit,
+                    )
+                })?;
+            #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+            let receive_inner_limit = negotiated_receive_limit.ok_or_else(|| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::UnsupportedExtension,
+                    PeerMisbehaved::UnsolicitedEncryptedExtension,
+                )
+            })?;
+            #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+            let receive_inner_limit = self
+                .config
+                .record_size_limit
+                .ok_or_else(|| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::UnsupportedExtension,
+                        PeerMisbehaved::UnsolicitedEncryptedExtension,
+                    )
+                })?
+                .into_inner();
+            if let Err(error) = cx
+                .common
+                .set_tls13_record_limits(send_inner_limit, receive_inner_limit)
+            {
+                let description = match error {
+                    Error::PeerSentOversizedRecord => AlertDescription::RecordOverflow,
+                    _ => AlertDescription::IllegalParameter,
+                };
+                return Err(cx.common.send_fatal_alert(description, error));
+            }
+        }
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1552,14 +1607,15 @@ impl ExpectTraffic {
         // Mustn't be interleaved with other handshake messages.
         common.check_aligned_handshake()?;
 
-        if common.should_update_key(key_update_request)? {
-            self.key_schedule
-                .update_encrypter_and_notify(common);
-        }
+        let should_respond = common.should_update_key(key_update_request)?;
 
-        // Update our read-side keys.
         self.key_schedule
-            .update_decrypter(common);
+            .update_decrypter(common, key_update_request)?;
+
+        if should_respond {
+            self.key_schedule
+                .update_encrypter_and_notify(common)?;
+        }
         Ok(())
     }
 }

@@ -9,10 +9,16 @@ use kernel::KernelConnection;
 
 use crate::common_state::{CommonState, Context, DEFAULT_BUFFER_LIMIT, IoState, State};
 use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
-use crate::error::{Error, PeerMisbehaved};
+use crate::error::{Error, InvalidMessage, PeerMisbehaved};
 use crate::log::trace;
 use crate::msgs::deframer::DeframerIter;
-use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
+use crate::msgs::deframer::buffers::{
+    BufferProgress, DeframerBuffer, Delocator, Locator,
+};
+#[cfg(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12")))]
+use crate::msgs::deframer::buffers::BoundedDeframerVecBuffer;
+#[cfg(not(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12"))))]
+use crate::msgs::deframer::buffers::DeframerVecBuffer;
 use crate::msgs::deframer::handshake::HandshakeDeframer;
 use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
@@ -23,6 +29,11 @@ use crate::vecbuf::ChunkVecBuffer;
 // pub so that it can be re-exported from the crate root
 pub mod kernel;
 pub(crate) mod unbuffered;
+
+#[cfg(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12")))]
+type ConnectionDeframerBuffer = BoundedDeframerVecBuffer;
+#[cfg(not(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12"))))]
+type ConnectionDeframerBuffer = DeframerVecBuffer;
 
 #[cfg(feature = "std")]
 mod connection {
@@ -62,7 +73,10 @@ mod connection {
         ///
         /// See [`ConnectionCommon::write_tls()`] for more information.
         pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
-            self.sendable_tls.write_to(wr)
+            match self {
+                Self::Client(conn) => conn.write_tls(wr),
+                Self::Server(conn) => conn.write_tls(wr),
+            }
         }
 
         /// Returns an object that allows reading plaintext.
@@ -410,7 +424,7 @@ impl ConnectionRandoms {
 /// Interface shared by client and server connections.
 pub struct ConnectionCommon<Data> {
     pub(crate) core: ConnectionCore<Data>,
-    deframer_buffer: DeframerVecBuffer,
+    deframer_buffer: ConnectionDeframerBuffer,
     sendable_plaintext: ChunkVecBuffer,
 }
 
@@ -518,7 +532,7 @@ impl<Data> ConnectionCommon<Data> {
     /// [`Connection::process_new_packets`]: crate::Connection::process_new_packets
     pub fn set_buffer_limit(&mut self, limit: Option<usize>) {
         self.sendable_plaintext.set_limit(limit);
-        self.sendable_tls.set_limit(limit);
+        self.set_outgoing_tls_buffer_limit(limit);
     }
 
     /// Sends a TLS1.3 `key_update` message to refresh a connection's keys.
@@ -709,6 +723,22 @@ impl<Data> ConnectionCommon<Data> {
     /// This is a shortcut to the `process_new_packets()` -> `process_msg()` ->
     /// `process_handshake_messages()` path, specialized for the first handshake message.
     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message<'static>>, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.core.common_state.is_quic() {
+            return match self
+                .core
+                .deframe_tlsrec(None, &mut self.deframer_buffer)?
+            {
+                Some(Deframed::Owned(message)) => {
+                    Ok(Some(Message::try_from(message.as_plain())?.into_owned()))
+                }
+                Some(Deframed::Borrowed(_)) => {
+                    unreachable!("selected TLS record receiver only emits owned events")
+                }
+                None => Ok(None),
+            };
+        }
+
         let mut buffer_progress = self.core.hs_deframer.progress();
 
         let res = self
@@ -718,7 +748,13 @@ impl<Data> ConnectionCommon<Data> {
                 self.deframer_buffer.filled_mut(),
                 &mut buffer_progress,
             )
-            .map(|opt| opt.map(|pm| Message::try_from(pm).map(|m| m.into_owned())));
+            .map(|opt| {
+                opt.map(|pm| match pm {
+                    Deframed::Borrowed(pm) => Message::try_from(pm).map(|m| m.into_owned()),
+                    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                    Deframed::Owned(pm) => Message::try_from(pm.as_plain()).map(|m| m.into_owned()),
+                })
+            });
 
         match res? {
             Some(Ok(msg)) => {
@@ -786,7 +822,8 @@ impl<Data> ConnectionCommon<Data> {
     /// After this function returns, the connection buffer may not yet be fully flushed. The
     /// [`CommonState::wants_write`] function can be used to check if the output buffer is empty.
     pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
-        self.sendable_tls.write_to(wr)
+        self.core.maybe_refresh_traffic_keys();
+        self.write_tls_records(wr)
     }
 }
 
@@ -818,7 +855,7 @@ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
     fn from(core: ConnectionCore<Data>) -> Self {
         Self {
             core,
-            deframer_buffer: DeframerVecBuffer::default(),
+            deframer_buffer: ConnectionDeframerBuffer::default(),
             sendable_plaintext: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
         }
     }
@@ -868,6 +905,47 @@ pub(crate) struct ConnectionCore<Data> {
     seen_consecutive_empty_fragments: u8,
 }
 
+pub(crate) enum Deframed<'a> {
+    Borrowed(InboundPlainMessage<'a>),
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    Owned(TlsrecOwnedMessage),
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+#[derive(Debug)]
+pub(crate) struct TlsrecOwnedMessage {
+    typ: ContentType,
+    version: ProtocolVersion,
+    payload: alloc::vec::Vec<u8>,
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+impl TlsrecOwnedMessage {
+    fn from_handshake(message: verus_tls13_record::OwnedHandshakeMessage) -> Self {
+        Self {
+            typ: ContentType::Handshake,
+            version: ProtocolVersion::from(message.legacy_version()),
+            payload: message.payload().to_vec(),
+        }
+    }
+
+    fn from_record(message: verus_tls13_record::OwnedPlainRecord) -> Self {
+        Self {
+            typ: ContentType::from(message.content_type as u8),
+            version: ProtocolVersion::from(message.legacy_version),
+            payload: message.payload,
+        }
+    }
+
+    pub(crate) fn as_plain(&self) -> InboundPlainMessage<'_> {
+        InboundPlainMessage {
+            typ: self.typ,
+            version: self.version,
+            payload: &self.payload,
+        }
+    }
+}
+
 impl<Data> ConnectionCore<Data> {
     pub(crate) fn new(state: Box<dyn State<Data>>, data: Data, common_state: CommonState) -> Self {
         Self {
@@ -879,11 +957,16 @@ impl<Data> ConnectionCore<Data> {
         }
     }
 
-    pub(crate) fn process_new_packets(
+    pub(crate) fn process_new_packets<B: DeframerBuffer>(
         &mut self,
-        deframer_buffer: &mut DeframerVecBuffer,
+        deframer_buffer: &mut B,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> Result<IoState, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.common_state.is_quic() {
+            return self.process_new_packets_tlsrec(deframer_buffer, sendable_plaintext);
+        }
+
         let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
             Ok(state) => state,
             Err(e) => {
@@ -914,7 +997,16 @@ impl<Data> ConnectionCore<Data> {
                 break;
             };
 
-            match self.process_msg(msg, state, Some(sendable_plaintext)) {
+            let processed = match msg {
+                Deframed::Borrowed(msg) => {
+                    self.process_msg(msg, state, Some(sendable_plaintext))
+                }
+                #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                Deframed::Owned(msg) => {
+                    self.process_msg(msg.as_plain(), state, Some(sendable_plaintext))
+                }
+            };
+            match processed {
                 Ok(new) => state = new,
                 Err(e) => {
                     self.state = Err(e.clone());
@@ -942,13 +1034,154 @@ impl<Data> ConnectionCore<Data> {
         Ok(self.common_state.current_io_state())
     }
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn process_new_packets_tlsrec<B: DeframerBuffer>(
+        &mut self,
+        deframer_buffer: &mut B,
+        sendable_plaintext: &mut ChunkVecBuffer,
+    ) -> Result<IoState, Error> {
+        let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
+            Ok(state) => state,
+            Err(error) => {
+                self.state = Err(error.clone());
+                return Err(error);
+            }
+        };
+
+        loop {
+            let message = match self.deframe_tlsrec(Some(&*state), deframer_buffer) {
+                Ok(Some(Deframed::Owned(message))) => message,
+                Ok(Some(Deframed::Borrowed(_))) => {
+                    unreachable!("selected TLS record receiver only emits owned events")
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    self.state = Err(error.clone());
+                    return Err(error);
+                }
+            };
+
+            match self.process_msg(message.as_plain(), state, Some(sendable_plaintext)) {
+                Ok(next) => state = next,
+                Err(error) => {
+                    self.state = Err(error.clone());
+                    return Err(error);
+                }
+            }
+
+            if self.common_state.has_received_close_notify {
+                let ignored = deframer_buffer.filled().len();
+                deframer_buffer.discard(ignored);
+                break;
+            }
+        }
+
+        #[cfg(feature = "std")]
+        if self.common_state.has_seen_eof {
+            if let Err(error) = deframer_buffer.tlsrec_finish() {
+                let error = self.handle_tlsrec_record_error(error, Some(&*state));
+                self.state = Err(error.clone());
+                return Err(error);
+            }
+        }
+
+        self.state = Ok(state);
+        Ok(self.common_state.current_io_state())
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(super) fn deframe_tlsrec<B: DeframerBuffer>(
+        &mut self,
+        state: Option<&dyn State<Data>>,
+        buffer: &mut B,
+    ) -> Result<Option<Deframed<'static>>, Error> {
+        loop {
+            if self.common_state.tlsrec_peer_handshake_has_message() {
+                return Ok(self.take_tcp_handshake_message());
+            }
+
+            if self.common_state.tlsrec_discard_after_close() {
+                let ignored = buffer.filled().len();
+                buffer.discard(ignored);
+                return Ok(None);
+            }
+
+            let record = match buffer.take_tlsrec_record() {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(self.handle_tlsrec_record_error(error, state)),
+            };
+            let disposition = self
+                .common_state
+                .tlsrec_receive_disposition()
+                .map_err(|error| self.handle_tlsrec_record_error(error, state))?;
+            let handshake_active = self.common_state.tlsrec_peer_handshake_is_active();
+            let Some(message) = self
+                .common_state
+                .record_layer
+                .decrypt_tlsrec_record(record, handshake_active, disposition)
+                .map_err(|error| self.handle_tlsrec_record_error(error, state))?
+            else {
+                continue;
+            };
+
+            if message.want_close_before_decrypt {
+                self.common_state.send_close_notify();
+            }
+
+            match message.content_type {
+                verus_tls13_record::ContentType::ChangeCipherSpec => {
+                    self.common_state
+                        .process_tlsrec_ccs_payload(message.protected, &message.payload)?;
+                    trace!("Dropping engine-validated CCS");
+                    continue;
+                }
+                verus_tls13_record::ContentType::Alert => {
+                    self.common_state
+                        .process_tlsrec_alert_payload(&message.payload)?;
+                    if self.common_state.tlsrec_discard_after_close() {
+                        let ignored = buffer.filled().len();
+                        buffer.discard(ignored);
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                verus_tls13_record::ContentType::ApplicationData => {
+                    return Ok(Some(Deframed::Owned(TlsrecOwnedMessage::from_record(
+                        message,
+                    ))));
+                }
+                verus_tls13_record::ContentType::Handshake => {}
+            }
+
+            let observation = self
+                .common_state
+                .observe_tlsrec_peer_handshake(
+                    ProtocolVersion::from(message.legacy_version),
+                    &message.payload,
+                )
+                .map_err(|error| self.handle_tlsrec_record_error(error, state))?;
+            let _ = observation;
+            if self.common_state.tlsrec_peer_handshake_has_message() {
+                self.common_state.record_layer.finish_trial_decryption();
+                return Ok(self.take_tcp_handshake_message());
+            }
+        }
+    }
+
     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
     fn deframe<'b>(
         &mut self,
         state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+    ) -> Result<Option<Deframed<'b>>, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.common_state.is_quic()
+            && self.common_state.tlsrec_peer_handshake_has_message()
+        {
+            return Ok(self.take_tcp_handshake_message());
+        }
         // before processing any more of `buffer`, return any extant messages from `hs_deframer`
         if self.hs_deframer.has_message_ready() {
             Ok(self.take_handshake_message(buffer, buffer_progress))
@@ -961,14 +1194,22 @@ impl<Data> ConnectionCore<Data> {
         &mut self,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Option<InboundPlainMessage<'b>> {
+    ) -> Option<Deframed<'b>> {
         self.hs_deframer
             .iter(buffer)
             .next()
             .map(|(message, discard)| {
                 buffer_progress.add_discard(discard);
-                message
+                Deframed::Borrowed(message)
             })
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn take_tcp_handshake_message<'b>(&mut self) -> Option<Deframed<'b>> {
+        self.common_state
+            .take_tlsrec_peer_handshake_message()
+            .map(TlsrecOwnedMessage::from_handshake)
+            .map(Deframed::Owned)
     }
 
     fn process_more_input<'b>(
@@ -976,12 +1217,15 @@ impl<Data> ConnectionCore<Data> {
         state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+    ) -> Result<Option<Deframed<'b>>, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if !self.common_state.is_quic() {
+            unreachable!("selected TCP input is driven by deframe_tlsrec")
+        }
         let version_is_tls13 = matches!(
             self.common_state.negotiated_version,
             Some(ProtocolVersion::TLSv1_3)
         );
-
         let locator = Locator::new(buffer);
 
         loop {
@@ -1090,7 +1334,7 @@ impl<Data> ConnectionCore<Data> {
             if unborrowed.typ != ContentType::Handshake {
                 let message = unborrowed.reborrow(&Delocator::new(buffer));
                 buffer_progress.add_discard(processed);
-                return Ok(Some(message));
+                return Ok(Some(Deframed::Borrowed(message)));
             }
 
             let message = unborrowed.reborrow(&Delocator::new(buffer));
@@ -1109,6 +1353,60 @@ impl<Data> ConnectionCore<Data> {
                 return Ok(self.take_handshake_message(buffer, buffer_progress));
             }
         }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn handle_tlsrec_record_error(
+        &mut self,
+        error: verus_tls13_record::Error,
+        state: Option<&dyn State<Data>>,
+    ) -> Error {
+        if matches!(
+            error,
+            verus_tls13_record::Error::BadRecordMac
+                | verus_tls13_record::Error::ProviderContract
+        ) {
+            if let Some(state) = state {
+                state.handle_decrypt_error();
+            }
+        }
+
+        let rustls_error = match error {
+            verus_tls13_record::Error::RecordOverflow => Error::PeerSentOversizedRecord,
+            verus_tls13_record::Error::BadRecordMac
+            | verus_tls13_record::Error::ProviderContract => Error::DecryptError,
+            verus_tls13_record::Error::UnexpectedMessage => {
+                InvalidMessage::UnexpectedMessage("invalid TLS 1.3 record transition").into()
+            }
+            verus_tls13_record::Error::DecodeError
+            | verus_tls13_record::Error::Truncated => {
+                InvalidMessage::UnexpectedMessage("invalid TLS 1.3 record encoding").into()
+            }
+            verus_tls13_record::Error::IllegalParameter => {
+                InvalidMessage::UnexpectedMessage("illegal TLS 1.3 record parameter").into()
+            }
+            verus_tls13_record::Error::ProviderExhausted => {
+                Error::General("TLS 1.3 record provider limit exhausted".into())
+            }
+            verus_tls13_record::Error::InvalidState => {
+                return Error::General("TLS 1.3 record receiver is terminal".into());
+            }
+        };
+        let Some(alert) = verus_tls13_record::record_error_alert(error) else {
+            return rustls_error;
+        };
+        let description = match alert {
+            verus_tls13_record::RecordAlert::UnexpectedMessage => {
+                AlertDescription::UnexpectedMessage
+            }
+            verus_tls13_record::RecordAlert::BadRecordMac => AlertDescription::BadRecordMac,
+            verus_tls13_record::RecordAlert::RecordOverflow => AlertDescription::RecordOverflow,
+            verus_tls13_record::RecordAlert::DecodeError => AlertDescription::DecodeError,
+            verus_tls13_record::RecordAlert::IllegalParameter => AlertDescription::IllegalParameter,
+            verus_tls13_record::RecordAlert::InternalError => AlertDescription::InternalError,
+        };
+        self.common_state
+            .send_fatal_alert(description, rustls_error)
     }
 
     fn handle_deframe_error(&mut self, error: Error, state: Option<&dyn State<Data>>) -> Error {
@@ -1132,6 +1430,9 @@ impl<Data> ConnectionCore<Data> {
                 self.common_state
                     .send_fatal_alert(AlertDescription::BadRecordMac, error)
             }
+            error @ Error::PeerMisbehaved(PeerMisbehaved::IllegalTlsInnerPlaintext) => self
+                .common_state
+                .send_fatal_alert(AlertDescription::UnexpectedMessage, error),
 
             error => error,
         }
@@ -1206,11 +1507,7 @@ impl<Data> ConnectionCore<Data> {
             return Err(Error::HandshakeNotComplete);
         }
 
-        if !self
-            .common_state
-            .sendable_tls
-            .is_empty()
-        {
+        if self.common_state.has_pending_tls_records() {
             return Err(Error::General(
                 "cannot convert into an KernelConnection while there are still buffered TLS records to send"
                     .into()
@@ -1259,7 +1556,9 @@ impl<Data> ConnectionCore<Data> {
                 .common_state
                 .refresh_traffic_keys_pending,
         ) {
-            let _ = self.refresh_traffic_keys();
+            if let Err(error) = self.refresh_traffic_keys() {
+                self.state = Err(error);
+            }
         }
     }
 

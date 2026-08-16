@@ -917,6 +917,10 @@ extension_struct! {
         ExtensionType::CompressCertificate =>
             pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
 
+        /// Maximum protected TLSInnerPlaintext accepted by the client (RFC8449)
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
+
         /// Session ticket offer or request (RFC5077/RFC8446)
         ExtensionType::SessionTicket =>
             pub(crate) session_ticket: Option<ClientSessionTicket>,
@@ -994,6 +998,7 @@ impl ClientExtensions<'_> {
             server_certificate_types,
             extended_master_secret_request,
             certificate_compression_algorithms,
+            record_size_limit,
             session_ticket,
             preshared_key_offer,
             early_data_request,
@@ -1022,6 +1027,7 @@ impl ClientExtensions<'_> {
             server_certificate_types,
             extended_master_secret_request,
             certificate_compression_algorithms,
+            record_size_limit,
             session_ticket,
             preshared_key_offer,
             early_data_request,
@@ -1239,6 +1245,10 @@ extension_struct! {
         ExtensionType::EarlyData =>
             pub(crate) early_data_ack: Option<()>,
 
+        /// Maximum protected TLSInnerPlaintext accepted by the server (RFC8449)
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
+
         /// Ticket request hint (RFC9149)
         ExtensionType::TicketRequest =>
             pub(crate) ticket_request: Option<ServerTicketRequestHint>,
@@ -1269,6 +1279,7 @@ impl ServerExtensions<'_> {
             transport_parameters,
             transport_parameters_draft,
             early_data_ack,
+            record_size_limit,
             ticket_request,
             encrypted_client_hello_ack,
             unknown_extensions,
@@ -1289,6 +1300,7 @@ impl ServerExtensions<'_> {
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             transport_parameters_draft: transport_parameters_draft.map(|x| x.into_owned()),
             early_data_ack,
+            record_size_limit,
             ticket_request,
             encrypted_client_hello_ack,
             unknown_extensions,

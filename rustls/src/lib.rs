@@ -440,6 +440,7 @@ mod hash_hs;
 mod limited_cache;
 mod rand;
 mod record_layer;
+mod record_size_limit;
 #[cfg(feature = "std")]
 mod stream;
 #[cfg(feature = "tls12")]
@@ -557,6 +558,7 @@ pub use crate::error::{
     PeerMisbehaved,
 };
 pub use crate::key_log::{KeyLog, NoKeyLog};
+pub use crate::record_size_limit::{InvalidRecordSizeLimit, RecordSizeLimit};
 #[cfg(feature = "std")]
 pub use crate::key_log_file::KeyLogFile;
 pub use crate::msgs::enums::NamedGroup;

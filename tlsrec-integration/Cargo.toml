@@ -1,0 +1,9 @@
+[package]
+name = "tlsrec-integration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0 OR ISC OR MIT"
+
+[dependencies]
+rustls = { path = "../rustls", default-features = false, features = ["aws_lc_rs", "std"] }

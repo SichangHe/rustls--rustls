@@ -1,10 +1,23 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cmp::min;
 
 use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
 use crate::error::Error;
 use crate::log::trace;
-use crate::msgs::message::{InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage};
+use crate::msgs::message::{
+    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage,
+};
+use crate::ContentType;
+#[cfg(test)]
+use crate::ProtocolVersion;
+use verus_tls13_record::{
+    AeadLimits as TlsrecAeadLimits, ContentType as TlsrecContentType, Error as TlsrecError,
+    Limit as TlsrecLimit, PreSealAction as TlsrecPreSealAction,
+    RecordReceiver as TlsrecRecordReceiver,
+    TrafficKeyProvider as TlsrecTrafficKeyProvider, TrafficSealer as TlsrecTrafficSealer,
+    UsageLimits as TlsrecUsageLimits,
+};
 
 #[derive(PartialEq)]
 enum DirectionState {
@@ -22,6 +35,8 @@ enum DirectionState {
 pub(crate) struct RecordLayer {
     message_encrypter: Box<dyn MessageEncrypter>,
     message_decrypter: Box<dyn MessageDecrypter>,
+    tlsrec_receiver: TlsrecRecordReceiver,
+    tlsrec_traffic_sealer: Option<TlsrecTrafficSealer>,
     write_seq_max: u64,
     write_seq: u64,
     read_seq: u64,
@@ -41,6 +56,8 @@ impl RecordLayer {
         Self {
             message_encrypter: <dyn MessageEncrypter>::invalid(),
             message_decrypter: <dyn MessageDecrypter>::invalid(),
+            tlsrec_receiver: TlsrecRecordReceiver::new(),
+            tlsrec_traffic_sealer: None,
             write_seq_max: 0,
             write_seq: 0,
             read_seq: 0,
@@ -100,6 +117,17 @@ impl RecordLayer {
         }
     }
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn decrypt_tlsrec_record(
+        &mut self,
+        record: verus_tls13_record::OwnedRecord,
+        handshake_active: bool,
+        disposition: verus_tls13_record::ReceiveDisposition,
+    ) -> Result<Option<verus_tls13_record::OwnedPlainRecord>, TlsrecError> {
+        self.tlsrec_receiver
+            .open_record(record, handshake_active, disposition)
+    }
+
     /// Encrypt a TLS message.
     ///
     /// `plain` is a TLS message we'd like to send.  This function
@@ -117,6 +145,54 @@ impl RecordLayer {
             .unwrap()
     }
 
+    pub(crate) fn encrypt_outgoing_alert(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        debug_assert_eq!(plain.typ, ContentType::Alert);
+        debug_assert!(self.encrypt_state == DirectionState::Active);
+        let seq = self.write_seq;
+        let encrypted = self.message_encrypter.encrypt(plain, seq)?;
+        self.write_seq = self.write_seq.checked_add(1).ok_or(Error::EncryptError)?;
+        Ok(encrypted)
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn encrypt_tlsrec_wire(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        let content_type = tlsrec_content_type(plain.typ)?;
+        let sealer = self
+            .tlsrec_traffic_sealer
+            .as_mut()
+            .ok_or(Error::EncryptError)?;
+        let protected = sealer
+            .seal(content_type, &plain.payload.to_vec(), 0)
+            .map_err(|_| Error::EncryptError)?;
+        self.write_seq = sealer.sequence();
+        Ok(protected.encode())
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    pub(crate) fn encrypt_tlsrec_alert_wire(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        if plain.typ != ContentType::Alert {
+            return Err(Error::EncryptError);
+        }
+        let sealer = self
+            .tlsrec_traffic_sealer
+            .as_mut()
+            .ok_or(Error::EncryptError)?;
+        let protected = sealer
+            .seal_final_alert(&plain.payload.to_vec())
+            .map_err(|_| Error::EncryptError)?;
+        self.write_seq = sealer.sequence();
+        Ok(protected.encode())
+    }
+
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
     pub(crate) fn prepare_message_encrypter(
@@ -125,6 +201,7 @@ impl RecordLayer {
         max_messages: u64,
     ) {
         self.message_encrypter = cipher;
+        self.tlsrec_traffic_sealer = None;
         self.write_seq = 0;
         self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
         self.encrypt_state = DirectionState::Prepared;
@@ -171,6 +248,146 @@ impl RecordLayer {
         self.trial_decryption_len = None;
     }
 
+    pub(crate) fn set_tlsrec_encrypter(
+        &mut self,
+        provider: Box<dyn TlsrecTrafficKeyProvider>,
+        secret: &[u8],
+        max_messages: u64,
+        send_inner_limit: TlsrecLimit,
+    ) {
+        self.tlsrec_traffic_sealer = Some(
+            TlsrecTrafficSealer::new(
+                provider,
+                secret,
+                send_inner_limit,
+                tlsrec_aead_limits(max_messages),
+            )
+            .expect("rustls supplied a valid TLS 1.3 traffic-key contract"),
+        );
+        self.write_seq = 0;
+        self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
+        self.encrypt_state = DirectionState::Active;
+    }
+
+    pub(crate) fn set_tlsrec_decrypter(
+        &mut self,
+        provider: Box<dyn TlsrecTrafficKeyProvider>,
+        secret: &[u8],
+        max_messages: u64,
+        receive_inner_limit: TlsrecLimit,
+    ) {
+        self.tlsrec_receiver
+            .install_handshake(
+                provider,
+                secret,
+                receive_inner_limit,
+                tlsrec_aead_limits(max_messages),
+            )
+            .expect("rustls supplied a valid TLS 1.3 AEAD contract");
+        self.decrypt_state = DirectionState::Active;
+        self.trial_decryption_len = None;
+    }
+
+    pub(crate) fn set_tlsrec_application_encrypter(
+        &mut self,
+        provider: Box<dyn TlsrecTrafficKeyProvider>,
+        secret: &[u8],
+        max_messages: u64,
+        send_inner_limit: TlsrecLimit,
+    ) {
+        self.tlsrec_traffic_sealer = Some(
+            TlsrecTrafficSealer::new(
+                provider,
+                secret,
+                send_inner_limit,
+                tlsrec_aead_limits(max_messages),
+            )
+            .expect("rustls supplied a valid TLS 1.3 traffic-key contract"),
+        );
+        self.write_seq = 0;
+        self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
+        self.encrypt_state = DirectionState::Active;
+    }
+
+    pub(crate) fn set_tlsrec_application_decrypter(
+        &mut self,
+        provider: Box<dyn TlsrecTrafficKeyProvider>,
+        secret: &[u8],
+        max_messages: u64,
+        receive_inner_limit: TlsrecLimit,
+    ) {
+        self.tlsrec_receiver
+            .install_traffic(
+                provider,
+                secret,
+                receive_inner_limit,
+                tlsrec_aead_limits(max_messages),
+            )
+            .expect("rustls supplied a valid TLS 1.3 traffic-key contract");
+        self.decrypt_state = DirectionState::Active;
+        self.trial_decryption_len = None;
+    }
+
+    pub(crate) fn seal_tlsrec_key_update(
+        &mut self,
+        request: verus_tls13_record::KeyUpdateRequest,
+    ) -> Result<Vec<u8>, Error> {
+        let sealer = self
+            .tlsrec_traffic_sealer
+            .as_mut()
+            .ok_or_else(|| Error::General("TLS 1.3 traffic sender is unavailable".into()))?;
+        let protected = sealer
+            .seal_key_update(request)
+            .map_err(|_| Error::General("TLS 1.3 traffic sender failed KeyUpdate".into()))?;
+        self.write_seq = sealer.sequence();
+        Ok(protected.encode())
+    }
+
+    pub(crate) fn advance_tlsrec_read_epoch(
+        &mut self,
+        reassembler: &mut verus_tls13_record::HandshakeReassembler,
+        request: verus_tls13_record::KeyUpdateRequest,
+    ) -> Result<(), Error> {
+        self.tlsrec_receiver
+            .advance_after_key_update(reassembler, request)
+            .map_err(|_| Error::General("TLS 1.3 traffic receiver failed KeyUpdate".into()))
+    }
+
+    pub(crate) fn tlsrec_write_secret(&self) -> Option<&[u8]> {
+        self.tlsrec_traffic_sealer
+            .as_ref()
+            .map(TlsrecTrafficSealer::current_secret)
+    }
+
+    pub(crate) fn tlsrec_read_secret(&self) -> Option<&[u8]> {
+        self.tlsrec_receiver.traffic_secret()
+    }
+
+    pub(crate) fn tighten_tlsrec_limits(
+        &mut self,
+        send_inner_limit: TlsrecLimit,
+        receive_inner_limit: TlsrecLimit,
+    ) -> Result<(), TlsrecError> {
+        if let Some(sealer) = self.tlsrec_traffic_sealer.as_mut() {
+            sealer.tighten_send_inner_limit(send_inner_limit)?;
+        }
+        self.tlsrec_receiver
+            .tighten_receive_inner_limit(receive_inner_limit)?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_tlsrec_receive_limit_offer(&mut self, limit: TlsrecLimit) {
+        self.tlsrec_receiver.begin_receive_limit_offer(limit);
+    }
+
+    pub(crate) fn resolve_tlsrec_receive_limit_offer(
+        &mut self,
+        negotiated: bool,
+    ) -> Result<Option<TlsrecLimit>, TlsrecError> {
+        self.tlsrec_receiver
+            .resolve_receive_limit_offer(negotiated)
+    }
+
     /// Set and start using the given `MessageDecrypter` for future incoming
     /// message decryption, and enable "trial decryption" mode for when TLS1.3
     /// 0-RTT is attempted but rejected by the server.
@@ -197,6 +414,13 @@ impl RecordLayer {
     /// `add` is added to the current sequence number.  `add` as `0` means
     /// "the next message processed by `encrypt_outgoing`"
     pub(crate) fn pre_encrypt_action(&self, add: u64) -> PreEncryptAction {
+        if let Some(sealer) = self.tlsrec_traffic_sealer.as_ref() {
+            return match sealer.pre_seal_action(add) {
+                TlsrecPreSealAction::Ready => PreEncryptAction::Nothing,
+                TlsrecPreSealAction::RefreshOrClose => PreEncryptAction::RefreshOrClose,
+                TlsrecPreSealAction::Refuse => PreEncryptAction::Refuse,
+            };
+        }
         match self.write_seq.saturating_add(add) {
             v if v == self.write_seq_max => PreEncryptAction::RefreshOrClose,
             SEQ_HARD_LIMIT.. => PreEncryptAction::Refuse,
@@ -211,18 +435,30 @@ impl RecordLayer {
     /// Return true if we have ever decrypted a message. This is used in place
     /// of checking the read_seq since that will be reset on key updates.
     pub(crate) fn has_decrypted(&self) -> bool {
-        self.has_decrypted
+        self.has_decrypted || self.tlsrec_receiver.has_decrypted()
     }
 
     pub(crate) fn write_seq(&self) -> u64 {
-        self.write_seq
+        self.tlsrec_traffic_sealer
+            .as_ref()
+            .map(TlsrecTrafficSealer::sequence)
+            .unwrap_or(self.write_seq)
     }
 
     pub(crate) fn read_seq(&self) -> u64 {
-        self.read_seq
+        if self.tlsrec_receiver.is_protected() {
+            self.tlsrec_receiver.sequence()
+        } else {
+            self.read_seq
+        }
     }
 
     pub(crate) fn encrypted_len(&self, payload_len: usize) -> usize {
+        if let Some(sealer) = self.tlsrec_traffic_sealer.as_ref() {
+            return sealer
+                .encrypted_payload_len(payload_len, 0)
+                .unwrap_or(usize::MAX);
+        }
         self.message_encrypter
             .encrypted_payload_len(payload_len)
     }
@@ -238,6 +474,23 @@ impl RecordLayer {
             }
             _ => false,
         }
+    }
+}
+
+fn tlsrec_aead_limits(max_messages: u64) -> TlsrecAeadLimits {
+    let max_records_by_bytes = u64::MAX / verus_tls13_record::MAX_CIPHERTEXT as u64;
+    let max_records = min(max_messages, max_records_by_bytes);
+    let max_bytes = max_records * verus_tls13_record::MAX_CIPHERTEXT as u64;
+    TlsrecAeadLimits::new(TlsrecUsageLimits::new(max_records, max_bytes, 1), 16)
+}
+
+fn tlsrec_content_type(content_type: ContentType) -> Result<TlsrecContentType, Error> {
+    match content_type {
+        ContentType::ChangeCipherSpec => Ok(TlsrecContentType::ChangeCipherSpec),
+        ContentType::Alert => Ok(TlsrecContentType::Alert),
+        ContentType::Handshake => Ok(TlsrecContentType::Handshake),
+        ContentType::ApplicationData => Ok(TlsrecContentType::ApplicationData),
+        _ => Err(Error::EncryptError),
     }
 }
 
@@ -271,7 +524,146 @@ const SEQ_HARD_LIMIT: u64 = 0xffff_ffff_ffff_fffeu64;
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::*;
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    struct PlainInnerAead;
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    impl verus_tls13_record::Aead for PlainInnerAead {
+        fn tag_len(&self) -> usize {
+            1
+        }
+
+        fn seal(
+            &mut self,
+            _nonce: &[u8; verus_tls13_record::NONCE_LEN],
+            _aad: &[u8; 5],
+            _payload: &mut Vec<u8>,
+        ) -> Result<(), verus_tls13_record::ProviderError> {
+            unreachable!("record-layer receive-limit fixture never seals")
+        }
+
+        fn open(
+            &mut self,
+            _nonce: &[u8; verus_tls13_record::NONCE_LEN],
+            _aad: &[u8; 5],
+            payload: &mut [u8],
+        ) -> Result<usize, verus_tls13_record::ProviderError> {
+            payload
+                .len()
+                .checked_sub(1)
+                .ok_or(verus_tls13_record::ProviderError)
+        }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    struct PlainInnerProvider;
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    impl TlsrecTrafficKeyProvider for PlainInnerProvider {
+        fn hash_len(&self) -> usize {
+            1
+        }
+
+        fn key_len(&self) -> usize {
+            1
+        }
+
+        fn expand(
+            &self,
+            _secret: &[u8],
+            _label: verus_tls13_record::HkdfLabel<'_>,
+            output: &mut [u8],
+        ) -> Result<(), verus_tls13_record::ProviderError> {
+            output.fill(0);
+            Ok(())
+        }
+
+        fn aead(
+            &self,
+            _key: &[u8],
+        ) -> Result<Box<dyn verus_tls13_record::Aead>, verus_tls13_record::ProviderError> {
+            Ok(Box::new(PlainInnerAead))
+        }
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn padded_handshake_record(inner_len: usize) -> Vec<u8> {
+        assert!(inner_len >= 2);
+        let mut payload = vec![0; inner_len + 1];
+        payload[0] = 1;
+        payload[1] = ContentType::Handshake.into();
+        payload
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn open_padded_handshake(record_layer: &mut RecordLayer, inner_len: usize) {
+        let payload = padded_handshake_record(inner_len);
+        record_layer
+            .decrypt_tlsrec_record(
+                verus_tls13_record::OwnedRecord {
+                    header: verus_tls13_record::RecordHeader {
+                        content_type: ContentType::ApplicationData.into(),
+                        legacy_version: 0x0303,
+                        length: u16::try_from(payload.len()).unwrap(),
+                    },
+                    payload,
+                },
+                true,
+                verus_tls13_record::ReceiveDisposition::Process,
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn record_layer_with_pending_limit(limit: TlsrecLimit) -> RecordLayer {
+        let mut record_layer = RecordLayer::new();
+        record_layer.begin_tlsrec_receive_limit_offer(limit);
+        record_layer.set_tlsrec_decrypter(
+            Box::new(PlainInnerProvider),
+            &[0],
+            100,
+            TlsrecLimit::rfc8446(),
+        );
+        record_layer
+    }
+
+    #[test]
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn pending_receive_limit_observes_every_authenticated_inner_plaintext() {
+        let offered = TlsrecLimit::new(64).unwrap();
+        let mut echoed = record_layer_with_pending_limit(offered);
+        // A small handshake fragment with padding makes the first record's
+        // complete TLSInnerPlaintext exceed the offer.  A smaller record then
+        // completes the hypothetical fragmented EncryptedExtensions.
+        open_padded_handshake(&mut echoed, 65);
+        open_padded_handshake(&mut echoed, 40);
+        assert_eq!(
+            echoed.resolve_tlsrec_receive_limit_offer(true),
+            Err(TlsrecError::RecordOverflow)
+        );
+
+        let mut omitted = record_layer_with_pending_limit(offered);
+        open_padded_handshake(&mut omitted, 65);
+        open_padded_handshake(&mut omitted, 40);
+        assert_eq!(omitted.resolve_tlsrec_receive_limit_offer(false), Ok(None));
+        assert_eq!(
+            omitted.resolve_tlsrec_receive_limit_offer(true),
+            Err(TlsrecError::InvalidState)
+        );
+
+        let mut exact = record_layer_with_pending_limit(offered);
+        open_padded_handshake(&mut exact, 64);
+        assert_eq!(
+            exact.resolve_tlsrec_receive_limit_offer(true),
+            Ok(Some(offered))
+        );
+    }
 
     #[test]
     fn test_has_decrypted() {

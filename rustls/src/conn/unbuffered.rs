@@ -6,7 +6,7 @@ use core::{fmt, mem};
 #[cfg(feature = "std")]
 use std::error::Error as StdError;
 
-use super::UnbufferedConnectionCommon;
+use super::{Deframed, UnbufferedConnectionCommon};
 use crate::Error;
 use crate::client::ClientConnectionData;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
@@ -85,12 +85,26 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 .common_state
                 .has_received_close_notify
             {
+                #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                {
+                    let ignored = buffer.filled_mut().len();
+                    buffer.queue_discard(ignored);
+                }
                 None
             } else {
-                match self
+                #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                let result = if !self.core.common_state.is_quic() {
+                    self.core.deframe_tlsrec(None, &mut buffer)
+                } else {
+                    self.core
+                        .deframe(None, buffer.filled_mut(), &mut buffer_progress)
+                };
+                #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+                let result = self
                     .core
-                    .deframe(None, buffer.filled_mut(), &mut buffer_progress)
-                {
+                    .deframe(None, buffer.filled_mut(), &mut buffer_progress);
+
+                match result {
                     Err(err) => {
                         buffer.queue_discard(buffer_progress.take_discard());
                         return UnbufferedStatus {
@@ -116,7 +130,12 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         }
                     };
 
-                match self.core.process_msg(msg, state, None) {
+                let processed = match msg {
+                    Deframed::Borrowed(msg) => self.core.process_msg(msg, state, None),
+                    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+                    Deframed::Owned(msg) => self.core.process_msg(msg.as_plain(), state, None),
+                };
+                match processed {
                     Ok(new) => state = new,
 
                     Err(e) => {

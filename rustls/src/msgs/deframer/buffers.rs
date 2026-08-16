@@ -4,8 +4,36 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::io;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", any(not(feature = "aws_lc_rs"), feature = "tls12")))]
 use crate::msgs::message::MAX_WIRE_SIZE;
+
+pub(crate) trait DeframerBuffer {
+    fn discard(&mut self, taken: usize);
+    fn filled_mut(&mut self) -> &mut [u8];
+    fn filled(&self) -> &[u8];
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn take_tlsrec_record(
+        &mut self,
+    ) -> Result<Option<verus_tls13_record::OwnedRecord>, verus_tls13_record::Error> {
+        let Some((record, wire_len)) =
+            verus_tls13_record::OwnedRecord::decode_prefix(self.filled())?
+        else {
+            return Ok(None);
+        };
+        self.discard(wire_len);
+        Ok(Some(record))
+    }
+
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    fn tlsrec_finish(&self) -> Result<(), verus_tls13_record::Error> {
+        if self.filled().is_empty() {
+            Ok(())
+        } else {
+            Err(verus_tls13_record::Error::Truncated)
+        }
+    }
+}
 
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
@@ -193,9 +221,87 @@ impl DeframerVecBuffer {
     }
 }
 
+impl DeframerBuffer for DeframerVecBuffer {
+    fn discard(&mut self, taken: usize) {
+        Self::discard(self, taken);
+    }
+
+    fn filled_mut(&mut self) -> &mut [u8] {
+        Self::filled_mut(self)
+    }
+
+    fn filled(&self) -> &[u8] {
+        Self::filled(self)
+    }
+}
+
+#[cfg(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12")))]
+#[derive(Debug, Default)]
+pub(crate) struct BoundedDeframerVecBuffer {
+    inner: verus_tls13_record::RecordBuffer,
+}
+
+#[cfg(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12")))]
+impl BoundedDeframerVecBuffer {
+    pub(crate) fn discard(&mut self, taken: usize) {
+        let bounded = core::cmp::min(taken, self.inner.buffered_len());
+        let _ = self.inner.discard_prefix(bounded);
+    }
+
+    pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
+        self.inner.buffered_mut()
+    }
+
+    pub(crate) fn filled(&self) -> &[u8] {
+        self.inner.buffered()
+    }
+
+    pub(crate) fn read(&mut self, rd: &mut dyn io::Read, _in_handshake: bool) -> io::Result<usize> {
+        let available = self.inner.remaining_capacity();
+        if available == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "bounded TLS record buffer full; process pending input",
+            ));
+        }
+        let mut scratch = [0u8; 4096];
+        let read_len = core::cmp::min(available, scratch.len());
+        let read = rd.read(&mut scratch[..read_len])?;
+        let accepted = self.inner.feed(&scratch[..read]);
+        debug_assert_eq!(accepted, read);
+        Ok(accepted)
+    }
+}
+
+#[cfg(all(feature = "aws_lc_rs", feature = "std", not(feature = "tls12")))]
+impl DeframerBuffer for BoundedDeframerVecBuffer {
+    fn discard(&mut self, taken: usize) {
+        Self::discard(self, taken);
+    }
+
+    fn filled_mut(&mut self) -> &mut [u8] {
+        Self::filled_mut(self)
+    }
+
+    fn filled(&self) -> &[u8] {
+        Self::filled(self)
+    }
+
+    fn take_tlsrec_record(
+        &mut self,
+    ) -> Result<Option<verus_tls13_record::OwnedRecord>, verus_tls13_record::Error> {
+        self.inner.next_record()
+    }
+
+    fn tlsrec_finish(&self) -> Result<(), verus_tls13_record::Error> {
+        self.inner.finish()
+    }
+}
+
 #[cfg(feature = "std")]
 impl DeframerVecBuffer {
     /// Read some bytes from `rd`, and add them to the buffer.
+    #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
     pub(crate) fn read(&mut self, rd: &mut dyn io::Read, in_handshake: bool) -> io::Result<usize> {
         if let Err(err) = self.prepare_read(in_handshake) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, err));
@@ -211,6 +317,7 @@ impl DeframerVecBuffer {
     }
 
     /// Resize the internal `buf` if necessary for reading more bytes.
+    #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
     fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
         /// TLS allows for handshake messages of up to 16MB.  We
         /// restrict that to 64KB to limit potential for denial-of-
@@ -292,5 +399,19 @@ impl<'a> DeframerSliceBuffer<'a> {
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.discard..]
+    }
+}
+
+impl DeframerBuffer for DeframerSliceBuffer<'_> {
+    fn discard(&mut self, taken: usize) {
+        self.queue_discard(taken);
+    }
+
+    fn filled_mut(&mut self) -> &mut [u8] {
+        Self::filled_mut(self)
+    }
+
+    fn filled(&self) -> &[u8] {
+        &self.buf[self.discard..]
     }
 }

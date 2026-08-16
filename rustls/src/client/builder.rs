@@ -171,6 +171,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             check_selected_alpn: true,
             resumption: Resumption::default(),
             max_fragment_size: None,
+            record_size_limit: None,
             client_auth_cert_resolver,
             versions: self.state.versions,
             enable_sni: true,

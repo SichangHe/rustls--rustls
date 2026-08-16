@@ -22,6 +22,7 @@ impl OutboundPlainMessage<'_> {
         HEADER_SIZE + record_layer.encrypted_len(self.payload.len())
     }
 
+    #[cfg(any(test, not(feature = "aws_lc_rs"), feature = "tls12"))]
     pub(crate) fn to_unencrypted_opaque(&self) -> OutboundOpaqueMessage {
         let mut payload = PrefixedPayload::with_capacity(self.payload.len());
         payload.extend_from_chunks(&self.payload);

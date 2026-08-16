@@ -203,6 +203,10 @@ pub struct ClientConfig {
     /// [ClientConnection::new]: crate::client::ClientConnection::new
     pub max_fragment_size: Option<usize>,
 
+    /// The RFC 8449 TLS 1.3 protected-record size this client advertises as
+    /// its receive capability. `None` (the default) omits the extension.
+    pub record_size_limit: Option<crate::RecordSizeLimit>,
+
     /// How to decide what client auth certificate/keys to use.
     pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
 
@@ -874,6 +878,12 @@ impl ConnectionCore<ClientConnectionData> {
         extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
     ) -> Result<Self, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if matches!(proto, Protocol::Tcp) && config.enable_early_data {
+            return Err(Error::General(
+                "early data is outside the verified TLS 1.3 record profile".into(),
+            ));
+        }
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
         common_state.protocol = proto;

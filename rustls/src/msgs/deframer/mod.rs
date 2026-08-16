@@ -1,10 +1,11 @@
 use core::mem;
 
 use crate::error::{Error, InvalidMessage};
+#[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
 use crate::msgs::codec::Reader;
-use crate::msgs::message::{
-    HEADER_SIZE, InboundOpaqueMessage, MessageError, read_opaque_message_header,
-};
+use crate::msgs::message::{HEADER_SIZE, InboundOpaqueMessage};
+#[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+use crate::msgs::message::{MessageError, read_opaque_message_header};
 
 pub(crate) mod buffers;
 pub(crate) mod handshake;
@@ -46,6 +47,48 @@ impl<'a> Iterator for DeframerIter<'a> {
     type Item = Result<InboundOpaqueMessage<'a>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        {
+            let (header, end) = match verus_tls13_record::inspect_record(self.buf) {
+                Ok(verus_tls13_record::StreamDecision::NeedMore) => return None,
+                Ok(verus_tls13_record::StreamDecision::Record { header, wire_len }) => {
+                    (header, wire_len)
+                }
+                Err(verus_tls13_record::Error::RecordOverflow) => {
+                    return Some(Err(Error::PeerSentOversizedRecord));
+                }
+                Err(_) => return Some(Err(InvalidMessage::InvalidContentType.into())),
+            };
+            let header_result = if header.content_type
+                == verus_tls13_record::ContentType::ApplicationData as u8
+            {
+                verus_tls13_record::validate_protected_header(header)
+                    .map(|_| verus_tls13_record::ContentType::ApplicationData)
+            } else {
+                verus_tls13_record::validate_plaintext_header(header)
+            };
+            if let Err(error) = header_result {
+                return Some(Err(match error {
+                    verus_tls13_record::Error::RecordOverflow => Error::PeerSentOversizedRecord,
+                    verus_tls13_record::Error::DecodeError => {
+                        InvalidMessage::InvalidEmptyPayload.into()
+                    }
+                    _ => InvalidMessage::InvalidContentType.into(),
+                }));
+            }
+            self.buf.get(HEADER_SIZE..end)?;
+            let (consumed, remainder) = mem::take(&mut self.buf).split_at_mut(end);
+            self.buf = remainder;
+            self.consumed += end;
+            return Some(Ok(InboundOpaqueMessage::new(
+                crate::ContentType::from(header.content_type),
+                crate::ProtocolVersion::from(header.legacy_version),
+                &mut consumed[HEADER_SIZE..],
+            )));
+        }
+
+        #[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
+        {
         let mut reader = Reader::init(self.buf);
 
         let (typ, version, len) = match read_opaque_message_header(&mut reader) {
@@ -79,6 +122,7 @@ impl<'a> Iterator for DeframerIter<'a> {
             version,
             &mut consumed[HEADER_SIZE..],
         )))
+        }
     }
 }
 

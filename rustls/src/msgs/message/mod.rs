@@ -13,6 +13,7 @@ pub use inbound::{BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage};
 mod outbound;
 use alloc::vec::Vec;
 
+#[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
 pub(crate) use outbound::read_opaque_message_header;
 pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
 
@@ -259,4 +260,5 @@ const MAX_PAYLOAD: u16 = 16_384 + 2048;
 
 /// Maximum on-the-wire message size.
 #[cfg(feature = "std")]
+#[cfg(any(not(feature = "aws_lc_rs"), feature = "tls12"))]
 pub(crate) const MAX_WIRE_SIZE: usize = MAX_PAYLOAD as usize + HEADER_SIZE;

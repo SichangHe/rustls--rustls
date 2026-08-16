@@ -14,6 +14,10 @@ members = [
   "provider-example",
   # the main library and tests
   "rustls",
+  # verified TLS 1.3 record and key-epoch engine
+  "verus-tls13-record",
+  # normal rustls API integration for the selected TLS 1.3 profile
+  "tlsrec-integration",
   # common code for testing the core crate
   "rustls-test",
   # benchmarking tool
@@ -97,6 +101,8 @@ x25519-dalek = "2"
 x509-parser = "0.17"
 zeroize = "1.8"
 zlib-rs = "0.6"
+
+verus-tls13-record = { path = "verus-tls13-record" }
 
 [profile.bench]
 codegen-units = 1

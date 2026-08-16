@@ -208,6 +208,15 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
         self,
         versions: &[&'static versions::SupportedProtocolVersion],
     ) -> Result<ConfigBuilder<S, WantsVerifier>, Error> {
+        #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+        if let Err(reason) =
+            crate::crypto::aws_lc_rs::tlsrec_provider_eligibility(&self.provider)
+        {
+            return Err(Error::General(alloc::format!(
+                "the verified TLS 1.3 record profile requires the exact aws_lc_rs provider components and a nonempty subset of its three supported TLS 1.3 cipher suites: {reason}"
+            )));
+        }
+
         let mut any_usable_suite = false;
         for suite in &self.provider.cipher_suites {
             if versions.contains(&suite.version()) {

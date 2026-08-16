@@ -235,6 +235,15 @@ fn emit_client_hello_for_retry(
         ..Default::default()
     });
 
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "tls12")))]
+    if supported_versions.tls13 && !cx.common.is_quic() {
+        exts.record_size_limit = config.record_size_limit.map(|limit| limit.get());
+        if let Some(limit) = config.record_size_limit {
+            cx.common
+                .begin_tls13_receive_limit_offer(limit.into_inner());
+        }
+    }
+
     match extra_exts.transport_parameters.clone() {
         Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
         Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),

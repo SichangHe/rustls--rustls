@@ -59,6 +59,10 @@ impl ChunkVecBuffer {
             - self.prefix_used
     }
 
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
     /// For a proposed append of `len` bytes, how many
     /// bytes should we actually append to adhere to the
     /// currently set `limit`?
@@ -216,6 +220,32 @@ impl ChunkVecBuffer {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 std::format!("illegal write_vectored return value ({used} > {available_bytes})"),
+            ));
+        }
+        self.consume(used);
+        Ok(used)
+    }
+
+    /// Write from the first chunk only.
+    ///
+    /// Unlike [`Self::write_to`], this never crosses a chunk boundary.  TLS
+    /// output queues store exactly one encoded record per chunk, so this can
+    /// finish a partially-written record before switching to a higher-priority
+    /// queue.
+    pub(crate) fn write_front_to(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
+        let Some(chunk) = self.chunks.front() else {
+            return Ok(0);
+        };
+        let available = &chunk[self.prefix_used..];
+        let used = wr.write(available)?;
+        if used > available.len() {
+            let available_len = available.len();
+            self.consume(available_len);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                std::format!(
+                    "illegal write return value ({used} > {available_len})"
+                ),
             ));
         }
         self.consume(used);

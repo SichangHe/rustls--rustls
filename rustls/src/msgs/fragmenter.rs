@@ -2,22 +2,29 @@ use crate::Error;
 use crate::enums::{ContentType, ProtocolVersion};
 use crate::msgs::message::{OutboundChunks, OutboundPlainMessage, PlainMessage};
 pub(crate) const MAX_FRAGMENT_LEN: usize = 16384;
+#[cfg(test)]
 pub(crate) const PACKET_OVERHEAD: usize = 1 + 2 + 2;
-pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
 
 pub struct MessageFragmenter {
-    max_frag: usize,
+    engine: verus_tls13_record::Fragmenter,
 }
 
 impl Default for MessageFragmenter {
     fn default() -> Self {
         Self {
-            max_frag: MAX_FRAGMENT_LEN,
+            engine: verus_tls13_record::Fragmenter::new(),
         }
     }
 }
 
 impl MessageFragmenter {
+    pub(crate) fn tighten_for_tls13_inner_limit(
+        &mut self,
+        limit: verus_tls13_record::Limit,
+    ) {
+        self.engine.tighten_peer_inner_limit(limit);
+    }
+
     /// Take `msg` and fragment it into new messages with the same type and version.
     ///
     /// Each returned message size is no more than `max_frag`.
@@ -45,7 +52,8 @@ impl MessageFragmenter {
         version: ProtocolVersion,
         payload: OutboundChunks<'a>,
     ) -> impl ExactSizeIterator<Item = OutboundPlainMessage<'a>> {
-        Chunker::new(payload, self.max_frag).map(move |payload| OutboundPlainMessage {
+        let plan = self.engine.plan(payload.len());
+        Chunker::new(payload, plan).map(move |payload| OutboundPlainMessage {
             typ,
             version,
             payload,
@@ -61,24 +69,21 @@ impl MessageFragmenter {
     ///
     /// Returns BadMaxFragmentSize if the size is smaller than 32 or larger than 16389.
     pub fn set_max_fragment_size(&mut self, max_fragment_size: Option<usize>) -> Result<(), Error> {
-        self.max_frag = match max_fragment_size {
-            Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz - PACKET_OVERHEAD,
-            None => MAX_FRAGMENT_LEN,
-            _ => return Err(Error::BadMaxFragmentSize),
-        };
-        Ok(())
+        self.engine
+            .set_max_wire_size(max_fragment_size)
+            .map_err(|_| Error::BadMaxFragmentSize)
     }
 }
 
 /// An iterator over borrowed fragments of a payload
 struct Chunker<'a> {
     payload: OutboundChunks<'a>,
-    limit: usize,
+    plan: verus_tls13_record::FragmentPlan,
 }
 
 impl<'a> Chunker<'a> {
-    fn new(payload: OutboundChunks<'a>, limit: usize) -> Self {
-        Self { payload, limit }
+    fn new(payload: OutboundChunks<'a>, plan: verus_tls13_record::FragmentPlan) -> Self {
+        Self { payload, plan }
     }
 }
 
@@ -90,7 +95,8 @@ impl<'a> Iterator for Chunker<'a> {
             return None;
         }
 
-        let (before, after) = self.payload.split_at(self.limit);
+        let take = self.plan.next()?;
+        let (before, after) = self.payload.split_at(take);
         self.payload = after;
         Some(before)
     }
@@ -98,7 +104,7 @@ impl<'a> Iterator for Chunker<'a> {
 
 impl ExactSizeIterator for Chunker<'_> {
     fn len(&self) -> usize {
-        (self.payload.len() + self.limit - 1) / self.limit
+        self.plan.len()
     }
 }
 
